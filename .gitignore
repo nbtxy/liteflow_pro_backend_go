@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/server
+/cmd/server/server
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test & coverage
+*.test
+*.out
+coverage.html
+
+# Dependency
+/vendor/
+
+# Build output
+/bin/
+/dist/
+/tmp/
