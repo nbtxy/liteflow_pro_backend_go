@@ -21,7 +21,7 @@ func NewExtractionScheduler(pool *pgxpool.Pool, extractor *Extractor) *Extractio
 }
 
 func (s *ExtractionScheduler) Start(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	slog.Info("memory extraction scheduler started")

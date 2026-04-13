@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 )
@@ -94,9 +95,27 @@ func (t *ManageScheduledTaskTool) Execute(ctx context.Context, input map[string]
 	if tc.MessageID != (uuid.UUID{}) {
 		input["_source_message_id"] = tc.MessageID.String()
 	}
+	if tc.ConversationID != (uuid.UUID{}) {
+		input["_conversation_id"] = tc.ConversationID.String()
+	}
 
 	result, err := t.manageFn(ctx, tc.UserID, action, input)
 	if err != nil {
+		promptLen := 0
+		if p, ok := input["prompt"].(string); ok {
+			promptLen = len([]rune(p))
+		}
+		slog.Error("manage_scheduled_task execute failed",
+			"action", action,
+			"userId", tc.UserID.String(),
+			"conversationId", input["_conversation_id"],
+			"sourceMessageId", input["_source_message_id"],
+			"taskId", input["task_id"],
+			"taskType", input["task_type"],
+			"cronExpression", input["cron_expression"],
+			"promptLen", promptLen,
+			"err", err,
+		)
 		return &ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 

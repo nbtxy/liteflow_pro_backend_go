@@ -246,6 +246,17 @@ func (s *Scheduler) CreateTask(ctx context.Context, t *domain.ScheduledTask) err
 	return nil
 }
 
+// CreateTaskAndSchedule creates a task and registers it in the in-memory scheduler when active.
+func (s *Scheduler) CreateTaskAndSchedule(ctx context.Context, t *domain.ScheduledTask) error {
+	if err := s.CreateTask(ctx, t); err != nil {
+		return err
+	}
+	if t.Status == "active" {
+		s.scheduleTask(t)
+	}
+	return nil
+}
+
 func (s *Scheduler) GetUserTasks(ctx context.Context, userID uuid.UUID) ([]domain.ScheduledTask, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT t.id, t.user_id, t.conversation_id, t.source_message_id, t.name, t.prompt, t.task_type,
@@ -295,6 +306,12 @@ func (s *Scheduler) DeleteTask(ctx context.Context, taskID, userID uuid.UUID) er
 	return err
 }
 
+// DeleteTaskAndCancel removes task from scheduler and database atomically in behavior.
+func (s *Scheduler) DeleteTaskAndCancel(ctx context.Context, taskID, userID uuid.UUID) error {
+	s.cancelTask(taskID)
+	return s.DeleteTask(ctx, taskID, userID)
+}
+
 func (s *Scheduler) DeleteTasksBySourceMessage(ctx context.Context, messageID uuid.UUID) (int64, error) {
 	tag, err := s.pool.Exec(ctx,
 		`DELETE FROM scheduled_tasks WHERE source_message_id = $1`, messageID)
@@ -321,6 +338,92 @@ func (s *Scheduler) UpdateTask(ctx context.Context, task *domain.ScheduledTask) 
 	return nil
 }
 
+// PauseTask updates status and cancels in-memory schedule.
+func (s *Scheduler) PauseTask(ctx context.Context, taskID, userID uuid.UUID) error {
+	if _, err := s.GetTaskByIDAndUser(ctx, taskID, userID); err != nil {
+		return err
+	}
+	if err := s.UpdateTaskStatus(ctx, taskID, "paused"); err != nil {
+		return err
+	}
+	s.cancelTask(taskID)
+	return nil
+}
+
+// ResumeTask updates status and re-registers in-memory schedule.
+func (s *Scheduler) ResumeTask(ctx context.Context, taskID, userID uuid.UUID) error {
+	task, err := s.GetTaskByIDAndUser(ctx, taskID, userID)
+	if err != nil {
+		return err
+	}
+	if err := s.UpdateTaskStatus(ctx, taskID, "active"); err != nil {
+		return err
+	}
+	task.Status = "active"
+	s.scheduleTask(task)
+	return nil
+}
+
+type TaskUpdateInput struct {
+	Name           *string
+	Prompt         *string
+	CronExpression *string
+	Timezone       *string
+	OutputConfig   *json.RawMessage
+}
+
+// UpdateTaskByUser updates a task and reschedules when cron changes while active.
+func (s *Scheduler) UpdateTaskByUser(ctx context.Context, taskID, userID uuid.UUID, in TaskUpdateInput) (*domain.ScheduledTask, error) {
+	task, err := s.GetTaskByIDAndUser(ctx, taskID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	cronChanged := false
+	if in.Name != nil {
+		task.Name = *in.Name
+	}
+	if in.Prompt != nil {
+		task.Prompt = *in.Prompt
+	}
+	if in.Timezone != nil {
+		task.Timezone = *in.Timezone
+	}
+	if in.OutputConfig != nil {
+		task.OutputConfig = *in.OutputConfig
+	}
+	if in.CronExpression != nil {
+		if *in.CronExpression != "" {
+			guard := NewSafetyGuard(s.pool, s.cfg)
+			if err := guard.ValidateCronExpression(*in.CronExpression, s.cfg.MinInterval); err != nil {
+				return nil, err
+			}
+		}
+
+		oldCron := ""
+		if task.CronExpression != nil {
+			oldCron = *task.CronExpression
+		}
+		newCron := *in.CronExpression
+		task.CronExpression = &newCron
+		cronChanged = oldCron != newCron
+	}
+	task.UpdatedAt = time.Now()
+
+	_, err = s.pool.Exec(ctx,
+		`UPDATE scheduled_tasks SET name=$1, prompt=$2, cron_expression=$3, timezone=$4, output_config=$5, updated_at=$6 WHERE id=$7`,
+		task.Name, task.Prompt, task.CronExpression, task.Timezone, task.OutputConfig, task.UpdatedAt, task.ID)
+	if err != nil {
+		return nil, fmt.Errorf("更新任务失败: %w", err)
+	}
+
+	if cronChanged && task.Status == "active" {
+		s.rescheduleTask(task)
+	}
+
+	return task, nil
+}
+
 // ── ManageTool bridge ──
 
 func (s *Scheduler) ManageTool(ctx context.Context, userID fmt.Stringer, action string, input map[string]any) (string, error) {
@@ -329,24 +432,37 @@ func (s *Scheduler) ManageTool(ctx context.Context, userID fmt.Stringer, action 
 		return "", fmt.Errorf("invalid user id")
 	}
 
+	var result string
 	switch action {
 	case "create":
-		return s.toolCreate(ctx, uid, input)
+		result, err = s.toolCreate(ctx, uid, input)
 	case "list":
-		return s.toolList(ctx, uid)
+		result, err = s.toolList(ctx, uid)
 	case "update":
-		return s.toolUpdate(ctx, uid, input)
+		result, err = s.toolUpdate(ctx, uid, input)
 	case "pause":
-		return s.toolPauseResume(ctx, uid, input, "paused")
+		result, err = s.toolPauseResume(ctx, uid, input, "paused")
 	case "resume":
-		return s.toolPauseResume(ctx, uid, input, "active")
+		result, err = s.toolPauseResume(ctx, uid, input, "active")
 	case "delete":
-		return s.toolDelete(ctx, uid, input)
+		result, err = s.toolDelete(ctx, uid, input)
 	case "run_now":
-		return s.toolRunNow(ctx, uid, input)
+		result, err = s.toolRunNow(ctx, uid, input)
 	default:
 		return "", fmt.Errorf("未知操作: %s", action)
 	}
+
+	if err != nil {
+		slog.Error("manage scheduled task failed",
+			"action", action,
+			"userId", uid.String(),
+			"taskId", input["task_id"],
+			"sourceMessageId", input["_source_message_id"],
+			"err", err,
+		)
+		return "", err
+	}
+	return result, nil
 }
 
 func (s *Scheduler) toolCreate(ctx context.Context, userID uuid.UUID, input map[string]any) (string, error) {
@@ -426,6 +542,11 @@ func (s *Scheduler) toolCreate(ctx context.Context, userID uuid.UUID, input map[
 		task.CronExpression = &cronExpr
 	}
 	task.RunAt = runAt
+	if convIDStr, ok := input["_conversation_id"].(string); ok {
+		if convID, err := uuid.Parse(convIDStr); err == nil {
+			task.ConversationID = &convID
+		}
+	}
 	if srcMsgStr, ok := input["_source_message_id"].(string); ok {
 		if srcMsgID, err := uuid.Parse(srcMsgStr); err == nil {
 			task.SourceMessageID = &srcMsgID

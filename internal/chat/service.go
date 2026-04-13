@@ -128,6 +128,18 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	llmReq := s.contextAsm.Assemble(history, conv.ID.String(), "", "")
 
 	assistantMsgID := uuid.New()
+	assistantMsg := &domain.Message{
+		ID:             assistantMsgID,
+		ConversationID: conv.ID,
+		Role:           "assistant",
+		Content:        "",
+		CreatedAt:      time.Now(),
+	}
+	if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
+		slog.Error("failed to create assistant placeholder message", "err", err)
+		events <- agent.ErrorEvent("save_failed", "保存消息失败")
+		return
+	}
 	usageAcc := &llm.LlmUsage{}
 	startTime := time.Now()
 
@@ -219,19 +231,13 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		}
 	}
 
-	assistantMsg := &domain.Message{
-		ID:             assistantMsgID,
-		ConversationID: conv.ID,
-		Role:           "assistant",
-		Content:        fullContent.String(),
-		Metadata:       metadata,
-		CreatedAt:      time.Now(),
-	}
-	tc := int32(len(fullContent.String()))
+	assistantMsg.Content = fullContent.String()
+	assistantMsg.Metadata = metadata
+	tc := int32(len(assistantMsg.Content))
 	assistantMsg.TokenCount = &tc
 
 	if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
-		slog.Error("failed to save assistant message", "err", err)
+		slog.Error("failed to update assistant message", "err", err)
 	}
 
 	durationMs := int32(time.Since(startTime).Milliseconds())
@@ -341,6 +347,18 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		llmReq := s.contextAsm.Assemble(history, conversationID, "", "")
 
 		newMsgID := uuid.New()
+		assistantMsg := &domain.Message{
+			ID:             newMsgID,
+			ConversationID: convID,
+			Role:           "assistant",
+			Content:        "",
+			CreatedAt:      time.Now(),
+		}
+		if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
+			slog.Error("failed to create regenerated placeholder message", "err", err)
+			events <- agent.ErrorEvent("save_failed", "保存消息失败")
+			return
+		}
 		usageAcc := &llm.LlmUsage{}
 		startTime := time.Now()
 
@@ -390,18 +408,12 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 		}
 
-		assistantMsg := &domain.Message{
-			ID:             newMsgID,
-			ConversationID: convID,
-			Role:           "assistant",
-			Content:        fullContent.String(),
-			CreatedAt:      time.Now(),
-		}
-		tc := int32(len(fullContent.String()))
+		assistantMsg.Content = fullContent.String()
+		tc := int32(len(assistantMsg.Content))
 		assistantMsg.TokenCount = &tc
 
 		if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
-			slog.Error("failed to save regenerated message", "err", err)
+			slog.Error("failed to update regenerated message", "err", err)
 		}
 
 		durationMs := int32(time.Since(startTime).Milliseconds())

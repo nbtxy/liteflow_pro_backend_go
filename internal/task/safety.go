@@ -3,10 +3,13 @@ package task
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liteflow/backend/internal/config"
+	"github.com/robfig/cron/v3"
 )
 
 type SafetyGuard struct {
@@ -24,6 +27,7 @@ func (g *SafetyGuard) CheckCanCreate(ctx context.Context, userID uuid.UUID) erro
 		`SELECT COUNT(*) FROM scheduled_tasks WHERE user_id = $1 AND status IN ('active', 'paused')`,
 		userID).Scan(&count)
 	if err != nil {
+		slog.Error("check can create failed", "userId", userID.String(), "err", err)
 		return fmt.Errorf("check task count: %w", err)
 	}
 	if count >= g.cfg.MaxPerUser {
@@ -57,5 +61,29 @@ func (g *SafetyGuard) CheckCanRun(ctx context.Context, userID uuid.UUID) error {
 		return fmt.Errorf("已达到每日Token用量限制")
 	}
 
+	return nil
+}
+
+func (g *SafetyGuard) ValidateCronExpression(cronExpr string, minIntervalMin int) error {
+	parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(cronExpr)
+	if err != nil {
+		return fmt.Errorf("cron 表达式格式无效，请使用 6 位格式（秒 分 时 日 月 周）")
+	}
+
+	now := time.Now()
+	first := schedule.Next(now)
+	if first.IsZero() {
+		return fmt.Errorf("cron 表达式无有效触发时间")
+	}
+	second := schedule.Next(first)
+	if second.IsZero() {
+		return fmt.Errorf("cron 表达式无有效触发时间")
+	}
+
+	minInterval := time.Duration(minIntervalMin) * time.Minute
+	if second.Sub(first) < minInterval {
+		return fmt.Errorf("任务执行间隔不能小于 %d 分钟", minIntervalMin)
+	}
 	return nil
 }

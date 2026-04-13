@@ -28,12 +28,12 @@ type managedConnection struct {
 }
 
 type Manager struct {
-	pool            *pgxpool.Pool
-	mcpClient       *mcp.Client
-	feishuHandler   *FeishuHandler
-	feishuEnabled   bool
-	activeConns     map[uuid.UUID]*managedConnection
-	activeConnsMu   sync.RWMutex
+	pool          *pgxpool.Pool
+	mcpClient     *mcp.Client
+	feishuHandler *FeishuHandler
+	feishuEnabled bool
+	activeConns   map[uuid.UUID]*managedConnection
+	activeConnsMu sync.RWMutex
 }
 
 func NewManager(pool *pgxpool.Pool, mcpClient *mcp.Client) *Manager {
@@ -150,6 +150,41 @@ func (m *Manager) IsFeishuConnected(channelID uuid.UUID) bool {
 	defer m.activeConnsMu.RUnlock()
 	_, ok := m.activeConns[channelID]
 	return ok
+}
+
+// HealthCheck verifies active Feishu channels have live in-memory connections.
+// If a connection is missing, it attempts to reconnect.
+func (m *Manager) HealthCheck(ctx context.Context) {
+	if !m.feishuEnabled || m.feishuHandler == nil {
+		return
+	}
+
+	rows, err := m.pool.Query(ctx,
+		`SELECT id, user_id, type, name, display_name, config, status, error_message, authorized_account_id, created_at, updated_at
+		 FROM user_channels WHERE type = 'im' AND name = 'feishu' AND status = 'active'`)
+	if err != nil {
+		slog.Warn("feishu health check query failed", "err", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ch domain.UserChannel
+		if err := rows.Scan(&ch.ID, &ch.UserID, &ch.Type, &ch.Name, &ch.DisplayName,
+			&ch.Config, &ch.Status, &ch.ErrorMessage, &ch.AuthorizedAccountID,
+			&ch.CreatedAt, &ch.UpdatedAt); err != nil {
+			slog.Warn("feishu health check scan failed", "err", err)
+			continue
+		}
+		if m.IsFeishuConnected(ch.ID) {
+			continue
+		}
+		if err := m.startFeishuConnection(&ch); err != nil {
+			slog.Error("feishu health check reconnect failed", "channelId", ch.ID, "err", err)
+		} else {
+			slog.Info("feishu health check reconnected", "channelId", ch.ID)
+		}
+	}
 }
 
 func (m *Manager) Create(ctx context.Context, ch *domain.UserChannel) error {

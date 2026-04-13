@@ -149,8 +149,9 @@ func (e *Executor) deliverOutput(ctx context.Context, task *domain.ScheduledTask
 	for _, t := range targets {
 		switch t {
 		case "conversation":
-			convID := task.ConversationID
+			convID := e.resolveConversationID(ctx, task)
 			if convID == nil {
+				slog.Warn("skip conversation output: missing conversation id", "taskId", task.ID)
 				continue
 			}
 			if err := e.sender.SendToConversation(ctx, task.UserID, *convID, task.Name, content); err != nil {
@@ -162,6 +163,28 @@ func (e *Executor) deliverOutput(ctx context.Context, task *domain.ScheduledTask
 			}
 		}
 	}
+}
+
+func (e *Executor) resolveConversationID(ctx context.Context, task *domain.ScheduledTask) *uuid.UUID {
+	if task.ConversationID != nil {
+		return task.ConversationID
+	}
+	if task.SourceMessageID == nil {
+		return nil
+	}
+
+	var convID uuid.UUID
+	if err := e.pool.QueryRow(ctx, `SELECT conversation_id FROM messages WHERE id = $1`, *task.SourceMessageID).Scan(&convID); err != nil {
+		slog.Warn("failed to resolve conversation id from source message",
+			"taskId", task.ID,
+			"sourceMessageId", *task.SourceMessageID,
+			"err", err,
+		)
+		return nil
+	}
+
+	task.ConversationID = &convID
+	return &convID
 }
 
 func parseOutputTargets(raw json.RawMessage) []string {

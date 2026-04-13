@@ -20,8 +20,13 @@ func NewToolExecutor(mcpTool domain.McpTool, client *Client, serverCfg ServerCon
 	return &ToolExecutor{mcpTool: mcpTool, client: client, serverCfg: serverCfg}
 }
 
-func (e *ToolExecutor) Name() string        { return e.mcpTool.ToolName }
-func (e *ToolExecutor) Description() string  { return e.mcpTool.Description }
+func (e *ToolExecutor) Name() string {
+	if e.mcpTool.DisplayName != "" {
+		return e.mcpTool.DisplayName
+	}
+	return e.mcpTool.ToolName
+}
+func (e *ToolExecutor) Description() string { return e.mcpTool.Description }
 
 func (e *ToolExecutor) InputSchema() map[string]any {
 	var schema map[string]any

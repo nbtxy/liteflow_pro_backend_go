@@ -9,23 +9,23 @@ import (
 )
 
 type App struct {
-	Cfg         config.Config
-	Pool        *pgxpool.Pool
-	JwtSvc      *auth.JwtService
-	AuthHandler *AuthHandler
-	ChatHandler *ChatHandler
-	ConvHandler *ConversationHandler
-	ArtifactHandler  *ArtifactHandler
-	MemoryHandler    *MemoryHandler
-	UserHandler      *UserHandler
-	FeedbackHandler  *FeedbackHandler
-	UsageHandler     *UsageHandler
-	AdminHandler     *AdminHandler
-	OssHandler       *OssHandler
-	SkillHandler     *SkillHandler
-	TaskHandler      *TaskHandler
-	ChannelHandler   *ChannelHandler
-	DebugHandler     *DebugHandler
+	Cfg             config.Config
+	Pool            *pgxpool.Pool
+	JwtSvc          *auth.JwtService
+	AuthHandler     *AuthHandler
+	ChatHandler     *ChatHandler
+	ConvHandler     *ConversationHandler
+	ArtifactHandler *ArtifactHandler
+	MemoryHandler   *MemoryHandler
+	UserHandler     *UserHandler
+	FeedbackHandler *FeedbackHandler
+	UsageHandler    *UsageHandler
+	AdminHandler    *AdminHandler
+	OssHandler      *OssHandler
+	SkillHandler    *SkillHandler
+	TaskHandler     *TaskHandler
+	ChannelHandler  *ChannelHandler
+	DebugHandler    *DebugHandler
 }
 
 func NewRouter(app *App) http.Handler {
@@ -105,6 +105,8 @@ func NewRouter(app *App) http.Handler {
 	// Tasks
 	mux.HandleFunc("GET /api/tasks", app.TaskHandler.List)
 	mux.HandleFunc("POST /api/tasks", app.TaskHandler.Create)
+	mux.HandleFunc("GET /api/tasks/{id}", app.TaskHandler.GetByID)
+	mux.HandleFunc("PUT /api/tasks/{id}", app.TaskHandler.Update)
 	mux.HandleFunc("DELETE /api/tasks/{id}", app.TaskHandler.Delete)
 	mux.HandleFunc("PATCH /api/tasks/{id}/status", app.TaskHandler.UpdateStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/pause", app.TaskHandler.Pause)

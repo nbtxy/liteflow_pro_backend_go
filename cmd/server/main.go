@@ -24,6 +24,7 @@ import (
 	"github.com/liteflow/backend/internal/conversation"
 	"github.com/liteflow/backend/internal/feedback"
 	"github.com/liteflow/backend/internal/llm"
+	"github.com/liteflow/backend/internal/maintenance"
 	"github.com/liteflow/backend/internal/mcp"
 	"github.com/liteflow/backend/internal/memory"
 	"github.com/liteflow/backend/internal/platform/postgres"
@@ -125,7 +126,7 @@ func main() {
 	skillRegistry := skill.NewRegistry()
 
 	// Task System (before tool registry so the tool can reference it)
-	taskExecutor := taskpkg.NewExecutor(pool)
+	taskExecutor := taskpkg.NewExecutor(pool, cfg.Tasks)
 	taskExecutor.SetProvider(providerRouter)
 	outputSender := taskpkg.NewOutputSender(pool, nil)
 	taskExecutor.SetOutputSender(outputSender)
@@ -185,10 +186,13 @@ func main() {
 	// Memory extraction scheduler
 	memExtractor := memory.NewExtractor(providerRouter, memorySvc)
 	memScheduler := memory.NewExtractionScheduler(pool, memExtractor)
+	maintScheduler := maintenance.NewMaintenanceScheduler(pool, cfg)
+	maintScheduler.SetChannelManager(channelMgr)
 
 	// Start background services
 	go taskScheduler.Start(ctx)
 	go memScheduler.Start(ctx)
+	go maintScheduler.Start(ctx)
 
 	// Handlers
 	app := &api.App{
