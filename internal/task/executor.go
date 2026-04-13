@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/liteflow/backend/internal/config"
 	"github.com/liteflow/backend/internal/domain"
 	"github.com/liteflow/backend/internal/llm"
 )
@@ -20,19 +21,22 @@ type OutputSender interface {
 
 type Executor struct {
 	pool     *pgxpool.Pool
+	cfg      config.TasksConfig
 	provider *llm.ProviderRouter
 	sender   OutputSender
 }
 
-func NewExecutor(pool *pgxpool.Pool) *Executor {
-	return &Executor{pool: pool}
+func NewExecutor(pool *pgxpool.Pool, cfg config.TasksConfig) *Executor {
+	return &Executor{pool: pool, cfg: cfg}
 }
 
 func (e *Executor) SetProvider(p *llm.ProviderRouter) { e.provider = p }
 func (e *Executor) SetOutputSender(s OutputSender)    { e.sender = s }
 
 func (e *Executor) Run(parentCtx context.Context, task *domain.ScheduledTask) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// Configurable timeout (≈ Java taskProperties.getExecutionTimeoutSeconds(), default 120s)
+	timeout := time.Duration(e.cfg.ExecTimeout) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	slog.Info("executing task", "taskId", task.ID, "name", task.Name)
@@ -45,6 +49,16 @@ func (e *Executor) Run(parentCtx context.Context, task *domain.ScheduledTask) {
 		CreatedAt: startTime,
 	}
 	e.saveExecution(ctx, exec)
+
+	// Runtime safety check before execution (≈ Java TaskExecutor calls safetyGuard.validateExecution)
+	guard := NewSafetyGuard(e.pool, e.cfg)
+	if err := guard.CheckCanRun(ctx, task.UserID); err != nil {
+		errMsg := err.Error()
+		exec.Status = "failed"
+		exec.ErrorMessage = &errMsg
+		e.finishExecution(ctx, exec, task, startTime)
+		return
+	}
 
 	provider := e.provider.Default()
 	if provider == nil {
@@ -75,7 +89,14 @@ func (e *Executor) Run(parentCtx context.Context, task *domain.ScheduledTask) {
 	}
 
 	exec.Status = "success"
-	exec.ResultSummary = &resp.Content
+
+	// Truncate result summary to 500 chars (≈ Java TaskExecutor truncates at 500)
+	summary := resp.Content
+	if len([]rune(summary)) > 500 {
+		summary = string([]rune(summary)[:500]) + "..."
+	}
+	exec.ResultSummary = &summary
+
 	if resp.Usage != nil {
 		in := int32(resp.Usage.InputTokens)
 		out := int32(resp.Usage.OutputTokens)
@@ -93,14 +114,26 @@ func (e *Executor) finishExecution(ctx context.Context, exec *domain.TaskExecuti
 	exec.DurationMs = &dur
 	e.saveExecution(ctx, exec)
 
+	// Update task statistics including total_runs and total_tokens
+	// (≈ Java TaskExecutor.recordRun updates totalRuns, totalTokens)
 	now := time.Now()
+	var tokensUsed int64
+	if exec.InputTokens != nil {
+		tokensUsed += int64(*exec.InputTokens)
+	}
+	if exec.OutputTokens != nil {
+		tokensUsed += int64(*exec.OutputTokens)
+	}
 	e.pool.Exec(ctx,
-		`UPDATE scheduled_tasks SET last_run_at = $1, last_run_status = $2, updated_at = $3 WHERE id = $4`,
-		now, exec.Status, now, task.ID)
+		`UPDATE scheduled_tasks SET last_run_at = $1, last_run_status = $2,
+		 total_runs = total_runs + 1, total_tokens = total_tokens + $3,
+		 updated_at = $4 WHERE id = $5`,
+		now, exec.Status, tokensUsed, now, task.ID)
 
+	// One-time tasks: mark as "stopped" (≈ Java uses "stopped", not "completed")
 	if task.TaskType == "once" {
 		e.pool.Exec(ctx,
-			`UPDATE scheduled_tasks SET status = 'completed', updated_at = $1 WHERE id = $2`,
+			`UPDATE scheduled_tasks SET status = 'stopped', updated_at = $1 WHERE id = $2`,
 			now, task.ID)
 	}
 

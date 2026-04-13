@@ -6,18 +6,35 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liteflow/backend/internal/config"
 	"github.com/liteflow/backend/internal/domain"
+	"github.com/robfig/cron/v3"
 )
 
+// cronParser parses 6-field Spring-style cron expressions (second minute hour dom month dow).
+var cronParser = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
+// Scheduler manages user-defined scheduled tasks using an event-driven cron scheduler.
+// Architecture aligned with Java TaskSchedulerService:
+//   - cron.Cron   ≈ Spring ThreadPoolTaskScheduler
+//   - entries map ≈ ConcurrentHashMap<UUID, ScheduledFuture<?>>
+//   - Start()     ≈ @EventListener(ApplicationReadyEvent)
 type Scheduler struct {
 	pool     *pgxpool.Pool
 	cfg      config.TasksConfig
 	executor *Executor
+
+	// Event-driven scheduler (replaces 30-second polling)
+	cron    *cron.Cron
+	entries map[uuid.UUID]cron.EntryID
+	timers  map[uuid.UUID]*time.Timer // for one-time tasks
+	mu      sync.Mutex
+	ctx     context.Context
 }
 
 func NewScheduler(pool *pgxpool.Pool, cfg config.TasksConfig, executor *Executor) *Scheduler {
@@ -25,74 +42,186 @@ func NewScheduler(pool *pgxpool.Pool, cfg config.TasksConfig, executor *Executor
 		pool:     pool,
 		cfg:      cfg,
 		executor: executor,
+		entries:  make(map[uuid.UUID]cron.EntryID),
+		timers:   make(map[uuid.UUID]*time.Timer),
 	}
 }
 
+// Start initializes the cron scheduler, loads all active tasks from DB, and blocks until ctx is cancelled.
+// Aligned with Java TaskSchedulerService.init() / @EventListener(ApplicationReadyEvent).
 func (s *Scheduler) Start(ctx context.Context) {
 	if !s.cfg.Enabled {
 		slog.Info("task scheduler disabled")
 		return
 	}
 
-	slog.Info("task scheduler started")
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	s.ctx = ctx
 
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("task scheduler stopped")
-			return
-		case <-ticker.C:
-			s.checkAndRun(ctx)
-		}
+	// 1. Initialize cron scheduler (≈ Java SchedulerConfig ThreadPoolTaskScheduler)
+	s.cron = cron.New(cron.WithParser(cronParser))
+
+	// 2. Load all active tasks from DB (≈ Java taskRepository.findByStatus("active"))
+	tasks := s.loadActiveTasks(ctx)
+
+	// 3. Register each task with the cron scheduler (≈ Java scheduleTask(task))
+	for i := range tasks {
+		s.scheduleTask(&tasks[i])
 	}
+
+	slog.Info("task scheduler started", "loadedTasks", len(tasks))
+
+	// 4. Start the cron scheduler
+	s.cron.Start()
+
+	// 5. Block until context cancelled, then graceful stop
+	<-ctx.Done()
+	s.cron.Stop()
+	s.mu.Lock()
+	for _, t := range s.timers {
+		t.Stop()
+	}
+	s.mu.Unlock()
+	slog.Info("task scheduler stopped")
 }
 
-func (s *Scheduler) checkAndRun(ctx context.Context) {
+// loadActiveTasks fetches all tasks with status='active' from DB.
+func (s *Scheduler) loadActiveTasks(ctx context.Context) []domain.ScheduledTask {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, user_id, conversation_id, name, prompt, task_type,
 		        cron_expression, run_at, timezone, output_config, status,
-		        max_tokens, enable_tools, last_run_at, total_runs, total_tokens
+		        max_tokens, enable_tools, last_run_at, total_runs, total_tokens,
+		        created_at
 		 FROM scheduled_tasks
 		 WHERE status = 'active'
-		 ORDER BY created_at ASC LIMIT 20`)
+		 ORDER BY created_at ASC`)
 	if err != nil {
-		slog.Error("failed to query active tasks", "err", err)
-		return
+		slog.Error("failed to load active tasks", "err", err)
+		return nil
 	}
 	defer rows.Close()
 
+	var tasks []domain.ScheduledTask
 	for rows.Next() {
 		var t domain.ScheduledTask
 		if err := rows.Scan(&t.ID, &t.UserID, &t.ConversationID, &t.Name, &t.Prompt,
 			&t.TaskType, &t.CronExpression, &t.RunAt, &t.Timezone, &t.OutputConfig, &t.Status,
-			&t.MaxTokens, &t.EnableTools, &t.LastRunAt, &t.TotalRuns, &t.TotalTokens); err != nil {
-			slog.Error("failed to scan task", "err", err)
+			&t.MaxTokens, &t.EnableTools, &t.LastRunAt, &t.TotalRuns, &t.TotalTokens,
+			&t.CreatedAt); err != nil {
+			slog.Error("failed to scan task during load", "err", err)
 			continue
 		}
+		tasks = append(tasks, t)
+	}
+	return tasks
+}
 
-		if s.shouldRun(&t) {
-			go s.executor.Run(ctx, &t)
-		}
+// scheduleTask registers a task with the cron scheduler.
+// Aligned with Java TaskSchedulerService.scheduleTask().
+//   - For recurring: uses CronTrigger (cron.AddFunc)
+//   - For once: uses time.Timer (≈ Java taskScheduler.schedule(exec, runAt))
+//   - Stores entry in entries/timers map (≈ Java scheduledFutures.put())
+func (s *Scheduler) scheduleTask(task *domain.ScheduledTask) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if task.TaskType == "once" {
+		s.scheduleOnceTaskLocked(task)
+	} else {
+		s.scheduleRecurringTaskLocked(task)
 	}
 }
 
-func (s *Scheduler) shouldRun(t *domain.ScheduledTask) bool {
-	if t.TaskType == "once" {
-		if t.RunAt != nil && time.Now().After(*t.RunAt) && t.TotalRuns == 0 {
-			return true
+func (s *Scheduler) scheduleOnceTaskLocked(task *domain.ScheduledTask) {
+	if task.RunAt == nil || task.TotalRuns > 0 {
+		return
+	}
+	delay := time.Until(*task.RunAt)
+	if delay < 0 {
+		return
+	}
+
+	taskID := task.ID
+	timer := time.AfterFunc(delay, func() {
+		// Fetch fresh state from DB before executing (≈ Java TaskExecutor.execute fetches from DB)
+		fresh, err := s.getTaskByID(context.Background(), taskID)
+		if err != nil || fresh.Status != "active" {
+			return
 		}
-		return false
-	}
-
-	if t.LastRunAt == nil {
-		return true
-	}
-
-	minInterval := time.Duration(s.cfg.MinInterval) * time.Minute
-	return time.Since(*t.LastRunAt) >= minInterval
+		s.executor.Run(context.Background(), fresh)
+		// Clean up timer entry
+		s.mu.Lock()
+		delete(s.timers, taskID)
+		s.mu.Unlock()
+	})
+	s.timers[task.ID] = timer
 }
+
+func (s *Scheduler) scheduleRecurringTaskLocked(task *domain.ScheduledTask) {
+	if task.CronExpression == nil || *task.CronExpression == "" {
+		return
+	}
+
+	taskID := task.ID
+	entryID, err := s.cron.AddFunc(*task.CronExpression, func() {
+		// Fetch fresh state from DB before executing (≈ Java TaskExecutor.execute fetches from DB)
+		fresh, err := s.getTaskByID(context.Background(), taskID)
+		if err != nil || fresh.Status != "active" {
+			return
+		}
+		s.executor.Run(context.Background(), fresh)
+	})
+	if err != nil {
+		slog.Error("failed to schedule recurring task", "taskId", task.ID, "cron", *task.CronExpression, "err", err)
+		return
+	}
+	s.entries[task.ID] = entryID
+	slog.Debug("scheduled recurring task", "taskId", task.ID, "cron", *task.CronExpression)
+}
+
+// cancelTask removes a task from the in-memory scheduler.
+// Aligned with Java TaskSchedulerService.cancelTask().
+func (s *Scheduler) cancelTask(taskID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if entryID, ok := s.entries[taskID]; ok {
+		s.cron.Remove(entryID)
+		delete(s.entries, taskID)
+	}
+	if timer, ok := s.timers[taskID]; ok {
+		timer.Stop()
+		delete(s.timers, taskID)
+	}
+}
+
+// rescheduleTask cancels and re-registers a task.
+// Aligned with Java TaskSchedulerService.rescheduleTask().
+func (s *Scheduler) rescheduleTask(task *domain.ScheduledTask) {
+	s.cancelTask(task.ID)
+	s.scheduleTask(task)
+}
+
+// getTaskByID fetches a task by ID (no user filter, internal use).
+func (s *Scheduler) getTaskByID(ctx context.Context, taskID uuid.UUID) (*domain.ScheduledTask, error) {
+	var t domain.ScheduledTask
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, user_id, conversation_id, source_message_id, name, prompt, task_type,
+		        cron_expression, run_at, timezone, output_config, status,
+		        max_tokens, enable_tools, last_run_at, last_run_status,
+		        total_runs, total_tokens, created_at, updated_at
+		 FROM scheduled_tasks WHERE id = $1`, taskID).Scan(
+		&t.ID, &t.UserID, &t.ConversationID, &t.SourceMessageID,
+		&t.Name, &t.Prompt, &t.TaskType, &t.CronExpression, &t.RunAt, &t.Timezone,
+		&t.OutputConfig, &t.Status, &t.MaxTokens, &t.EnableTools,
+		&t.LastRunAt, &t.LastRunStatus, &t.TotalRuns, &t.TotalTokens,
+		&t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// ── CRUD Operations ──
 
 func (s *Scheduler) CreateTask(ctx context.Context, t *domain.ScheduledTask) error {
 	if t.ID == uuid.Nil {
@@ -175,7 +304,25 @@ func (s *Scheduler) DeleteTasksBySourceMessage(ctx context.Context, messageID uu
 	return tag.RowsAffected(), nil
 }
 
-// ManageTool is the bridge function for the manage_scheduled_task tool.
+// UpdateTask updates task fields and reschedules if cron changed.
+func (s *Scheduler) UpdateTask(ctx context.Context, task *domain.ScheduledTask) error {
+	task.UpdatedAt = time.Now()
+	_, err := s.pool.Exec(ctx,
+		`UPDATE scheduled_tasks SET name=$1, prompt=$2, cron_expression=$3, timezone=$4,
+		 output_config=$5, updated_at=$6 WHERE id=$7`,
+		task.Name, task.Prompt, task.CronExpression, task.Timezone, task.OutputConfig, task.UpdatedAt, task.ID)
+	if err != nil {
+		return fmt.Errorf("update task: %w", err)
+	}
+	// Reschedule if task is active (≈ Java Controller calls rescheduleTask on cron change)
+	if task.Status == "active" {
+		s.rescheduleTask(task)
+	}
+	return nil
+}
+
+// ── ManageTool bridge ──
+
 func (s *Scheduler) ManageTool(ctx context.Context, userID fmt.Stringer, action string, input map[string]any) (string, error) {
 	uid, err := uuid.Parse(userID.String())
 	if err != nil {
@@ -249,8 +396,15 @@ func (s *Scheduler) toolCreate(ctx context.Context, userID uuid.UUID, input map[
 		}
 	}
 
-	// Safety check
+	// Cron validation (≈ Java TaskSafetyGuard.validateCreate cron check)
 	guard := NewSafetyGuard(s.pool, s.cfg)
+	if taskType != "once" && cronExpr != "" {
+		if err := guard.ValidateCronExpression(cronExpr, s.cfg.MinInterval); err != nil {
+			return "", err
+		}
+	}
+
+	// Safety check: max tasks per user
 	if err := guard.CheckCanCreate(ctx, userID); err != nil {
 		return "", err
 	}
@@ -258,15 +412,15 @@ func (s *Scheduler) toolCreate(ctx context.Context, userID uuid.UUID, input map[
 	outputConfig := buildOutputConfig(input)
 
 	task := &domain.ScheduledTask{
-		ID:          uuid.New(),
-		UserID:      userID,
-		Name:        name,
-		Prompt:      prompt,
-		TaskType:    taskType,
-		Timezone:    timezone,
+		ID:           uuid.New(),
+		UserID:       userID,
+		Name:         name,
+		Prompt:       prompt,
+		TaskType:     taskType,
+		Timezone:     timezone,
 		OutputConfig: outputConfig,
-		Status:      "active",
-		EnableTools: true,
+		Status:       "active",
+		EnableTools:  true,
 	}
 	if cronExpr != "" {
 		task.CronExpression = &cronExpr
@@ -281,6 +435,9 @@ func (s *Scheduler) toolCreate(ctx context.Context, userID uuid.UUID, input map[
 	if err := s.CreateTask(ctx, task); err != nil {
 		return "", fmt.Errorf("创建任务失败: %w", err)
 	}
+
+	// Register with cron scheduler (≈ Java scheduleTask after DB save)
+	s.scheduleTask(task)
 
 	timeDesc := cronExpr
 	if taskType == "once" && runAt != nil {
@@ -318,7 +475,7 @@ func (s *Scheduler) toolList(ctx context.Context, userID uuid.UUID) (string, err
 		switch t.Status {
 		case "paused":
 			statusLabel = "● 已暂停"
-		case "completed", "stopped":
+		case "stopped":
 			statusLabel = "● 已完成"
 		}
 
@@ -357,6 +514,7 @@ func (s *Scheduler) toolUpdate(ctx context.Context, userID uuid.UUID, input map[
 		return "", err
 	}
 
+	cronChanged := false
 	if v, ok := input["name"].(string); ok && v != "" {
 		task.Name = v
 	}
@@ -364,7 +522,13 @@ func (s *Scheduler) toolUpdate(ctx context.Context, userID uuid.UUID, input map[
 		task.Prompt = v
 	}
 	if v, ok := input["cron_expression"].(string); ok && v != "" {
+		// Validate new cron expression (≈ Java TaskSafetyGuard cron validation on update)
+		guard := NewSafetyGuard(s.pool, s.cfg)
+		if err := guard.ValidateCronExpression(v, s.cfg.MinInterval); err != nil {
+			return "", err
+		}
 		task.CronExpression = &v
+		cronChanged = true
 	}
 	if v, ok := input["timezone"].(string); ok && v != "" {
 		task.Timezone = v
@@ -379,6 +543,11 @@ func (s *Scheduler) toolUpdate(ctx context.Context, userID uuid.UUID, input map[
 		task.Name, task.Prompt, task.CronExpression, task.Timezone, task.OutputConfig, task.UpdatedAt, task.ID)
 	if err != nil {
 		return "", fmt.Errorf("更新任务失败: %w", err)
+	}
+
+	// Reschedule if cron changed and task is active (≈ Java Controller rescheduleTask)
+	if cronChanged && task.Status == "active" {
+		s.rescheduleTask(task)
 	}
 
 	timeDesc := ""
@@ -404,8 +573,14 @@ func (s *Scheduler) toolPauseResume(ctx context.Context, userID uuid.UUID, input
 	}
 
 	if newStatus == "paused" {
+		// Cancel in-memory schedule (≈ Java pauseTask calls schedulerService.cancelTask)
+		s.cancelTask(taskID)
 		return fmt.Sprintf("%s 已暂停。说\"恢复\"可以重新启动。", task.Name), nil
 	}
+
+	// Resume: re-register with scheduler (≈ Java resumeTask calls schedulerService.scheduleTask)
+	task.Status = "active"
+	s.scheduleTask(task)
 	return fmt.Sprintf("%s 已恢复运行。", task.Name), nil
 }
 
@@ -419,6 +594,9 @@ func (s *Scheduler) toolDelete(ctx context.Context, userID uuid.UUID, input map[
 	if err != nil {
 		return "", err
 	}
+
+	// Cancel from scheduler first (≈ Java deleteTask calls schedulerService.cancelTask before DB delete)
+	s.cancelTask(taskID)
 
 	if err := s.DeleteTask(ctx, taskID, userID); err != nil {
 		return "", fmt.Errorf("删除失败: %w", err)
@@ -437,6 +615,7 @@ func (s *Scheduler) toolRunNow(ctx context.Context, userID uuid.UUID, input map[
 		return "", err
 	}
 
+	// Execute immediately without affecting normal schedule (≈ Java taskScheduler.schedule(exec, Instant.now()))
 	go s.executor.Run(ctx, task)
 	return fmt.Sprintf("正在执行\"%s\"，结果将推送到设定的渠道。", task.Name), nil
 }
@@ -459,6 +638,8 @@ func (s *Scheduler) GetTaskByIDAndUser(ctx context.Context, taskID, userID uuid.
 	}
 	return &t, nil
 }
+
+// ── Helpers ──
 
 func parseTaskID(input map[string]any) (uuid.UUID, error) {
 	s, _ := input["task_id"].(string)
