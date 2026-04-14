@@ -168,6 +168,11 @@ func main() {
 	toolRegistry.Register(tool.NewMemoryManage(memorySvc.ManageTool))
 	toolRegistry.Register(tool.NewSearchSkill(skillRegistry.Search))
 	toolRegistry.Register(tool.NewManageScheduledTask(taskScheduler.ManageTool))
+	toolRegistry.Register(tool.NewCreateFile(storageSvc, artifactSvc.CreateFileArtifact))
+	toolRegistry.Register(tool.NewEditFile(storageSvc, artifactSvc.CreateFileArtifact))
+	toolRegistry.Register(tool.NewReadFile(storageSvc))
+	toolRegistry.Register(tool.NewListFiles(artifactSvc.GetLatestArtifacts))
+	toolRegistry.Register(tool.NewDeleteFile(artifactSvc.DeleteByPath))
 
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()
