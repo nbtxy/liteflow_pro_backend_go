@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -129,7 +130,7 @@ func (h *ConversationHandler) GetMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	OK(w, msgs)
+	OK(w, flattenMessages(msgs))
 }
 
 func (h *ConversationHandler) UpdateTitle(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +286,56 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	OKEmpty(w)
+}
+
+// messageResponse is the API response DTO that extracts toolCalls and attachments
+// from metadata to top-level fields, matching the frontend Message interface.
+type messageResponse struct {
+	ID             uuid.UUID       `json:"id"`
+	ConversationID uuid.UUID       `json:"conversationId"`
+	Role           string          `json:"role"`
+	Content        string          `json:"content"`
+	TokenCount     *int32          `json:"tokenCount,omitempty"`
+	CreatedAt      string          `json:"createdAt"`
+	ToolCalls      json.RawMessage `json:"toolCalls,omitempty"`
+	ContentParts   json.RawMessage `json:"contentParts,omitempty"`
+	Attachments    json.RawMessage `json:"attachments,omitempty"`
+	QuotedMessage  json.RawMessage `json:"quotedMessage,omitempty"`
+}
+
+func flattenMessages(msgs []domain.Message) []messageResponse {
+	result := make([]messageResponse, len(msgs))
+	for i, m := range msgs {
+		resp := messageResponse{
+			ID:             m.ID,
+			ConversationID: m.ConversationID,
+			Role:           m.Role,
+			Content:        m.Content,
+			TokenCount:     m.TokenCount,
+			CreatedAt:      m.CreatedAt.Format("2006-01-02T15:04:05.000Z"),
+		}
+
+		if len(m.Metadata) > 0 {
+			var meta map[string]json.RawMessage
+			if json.Unmarshal(m.Metadata, &meta) == nil {
+				if tc, ok := meta["toolCalls"]; ok {
+					resp.ToolCalls = tc
+				}
+				if cp, ok := meta["contentParts"]; ok {
+					resp.ContentParts = cp
+				}
+				if att, ok := meta["attachments"]; ok {
+					resp.Attachments = att
+				}
+				if qm, ok := meta["quotedMessage"]; ok {
+					resp.QuotedMessage = qm
+				}
+			}
+		}
+
+		result[i] = resp
+	}
+	return result
 }
 
 func (h *ConversationHandler) ClearMessages(w http.ResponseWriter, r *http.Request) {

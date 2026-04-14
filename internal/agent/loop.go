@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -21,9 +22,9 @@ const (
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string) ([]tool.Tool, error)
 
 type AgentLoop struct {
-	providerRouter  *llm.ProviderRouter
-	toolRegistry    *tool.Registry
-	mcpExecBuilder  McpExecutorBuilder
+	providerRouter *llm.ProviderRouter
+	toolRegistry   *tool.Registry
+	mcpExecBuilder McpExecutorBuilder
 }
 
 func NewAgentLoop(providerRouter *llm.ProviderRouter, toolRegistry *tool.Registry) *AgentLoop {
@@ -104,9 +105,10 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 
 			if result != nil && result.Metadata != nil {
 				if mode, ok := result.Metadata["mcp_mode"].(string); ok {
-					if mode == "active" {
+					switch mode {
+					case "active":
 						nextMcpMode = true
-					} else if mode == "inactive" {
+					case "inactive":
 						nextMcpMode = false
 					}
 				}
@@ -262,9 +264,11 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	slog.Info("tool executing", "toolName", tc.name, "callId", tc.id)
 
 	var input map[string]any
+	var argsParseErr error
 	if err := json.Unmarshal([]byte(tc.arguments), &input); err != nil {
 		slog.Warn("failed to parse tool arguments", "toolName", tc.name, "err", err)
 		input = map[string]any{}
+		argsParseErr = err
 	}
 
 	events = append(events, ToolUseStartEvent(tc.id, tc.name))
@@ -281,6 +285,11 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	if t == nil {
 		slog.Warn("tool not found", "toolName", tc.name)
 		result = &tool.ToolResult{Content: "工具不存在: " + tc.name, IsError: true}
+	} else if argsParseErr != nil {
+		result = &tool.ToolResult{
+			Content: fmt.Sprintf("工具参数不是合法 JSON，请重试并输出完整参数。parse error: %v", argsParseErr),
+			IsError: true,
+		}
 	} else {
 		execCtx, cancel := context.WithTimeout(ctx, ToolTimeout)
 		defer cancel()

@@ -268,6 +268,9 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 		}
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
 			for _, tc := range msg.ToolCalls {
+				if !isValidToolArgumentsJSON(tc.Function.Arguments) {
+					continue
+				}
 				requestedIDs[tc.ID] = true
 			}
 		}
@@ -276,8 +279,25 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 	var sanitized []LlmMessage
 	for _, msg := range messages {
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			allResponded := true
+			validToolCalls := make([]ToolCall, 0, len(msg.ToolCalls))
 			for _, tc := range msg.ToolCalls {
+				if !isValidToolArgumentsJSON(tc.Function.Arguments) {
+					slog.Warn("dropping assistant tool call with invalid arguments JSON",
+						"toolCallId", tc.ID,
+						"toolName", tc.Function.Name)
+					continue
+				}
+				validToolCalls = append(validToolCalls, tc)
+			}
+			if len(validToolCalls) == 0 {
+				if msg.Content != "" {
+					sanitized = append(sanitized, LlmMessage{Role: "assistant", Content: msg.Content})
+				}
+				continue
+			}
+
+			allResponded := true
+			for _, tc := range validToolCalls {
 				if !respondedIDs[tc.ID] {
 					allResponded = false
 					break
@@ -289,6 +309,8 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 				}
 				continue
 			}
+
+			msg.ToolCalls = validToolCalls
 		}
 
 		if msg.Role == "tool" && msg.ToolCallID != "" {
@@ -301,6 +323,18 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 	}
 
 	return sanitized
+}
+
+func isValidToolArgumentsJSON(arguments string) bool {
+	if strings.TrimSpace(arguments) == "" {
+		return false
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(arguments), &obj); err != nil {
+		return false
+	}
+	return true
 }
 
 func overrideActiveMcpDescription(defs []ToolDefinition, description string) []ToolDefinition {

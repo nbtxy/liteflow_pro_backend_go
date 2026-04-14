@@ -284,8 +284,89 @@ func (s *Service) SaveMessage(ctx context.Context, msg *domain.Message) error {
 }
 
 func (s *Service) DeleteMessage(ctx context.Context, messageID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM messages WHERE id = $1`, messageID)
-	return err
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var conversationID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT conversation_id FROM messages WHERE id = $1`, messageID).Scan(&conversationID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("get conversation id by message: %w", err)
+	}
+
+	filePaths, err := s.listDeletableFilePathsByMessageTx(ctx, tx, messageID)
+	if err != nil {
+		return fmt.Errorf("list deletable file paths by message: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE artifacts
+		 SET file_deleted = true
+		 WHERE message_id = $1`,
+		messageID); err != nil {
+		return fmt.Errorf("mark artifacts deleted by message: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = $1`, messageID); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	if s.storageSvc != nil {
+		for _, path := range filePaths {
+			if path == "" {
+				continue
+			}
+			if err := s.storageSvc.DeleteFile(ctx, conversationID.String(), path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.Warn("failed to cleanup file by deleted message",
+					"conversationId", conversationID.String(),
+					"messageId", messageID.String(),
+					"path", path,
+					"err", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) listDeletableFilePathsByMessageTx(ctx context.Context, tx pgx.Tx, messageID uuid.UUID) ([]string, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT a.file_path
+		 FROM artifacts a
+		 WHERE a.message_id = $1
+		   AND a.file_path <> ''
+		   AND (a.file_deleted IS NULL OR a.file_deleted = FALSE)
+		   AND NOT EXISTS (
+		     SELECT 1
+		     FROM artifacts b
+		     WHERE b.conversation_id = a.conversation_id
+		       AND b.file_path = a.file_path
+		       AND (b.file_deleted IS NULL OR b.file_deleted = FALSE)
+		       AND (b.message_id IS DISTINCT FROM $1)
+		   )`,
+		messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	paths := make([]string, 0, 8)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
 }
 
 func (s *Service) GetMessageByID(ctx context.Context, messageID uuid.UUID) (*domain.Message, error) {

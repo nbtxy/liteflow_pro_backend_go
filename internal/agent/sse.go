@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 type SSEWriter struct {
@@ -16,6 +17,12 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return nil, fmt.Errorf("streaming not supported")
+	}
+
+	// 取消该连接的写超时，避免长时间 SSE 流被服务器中断
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Warn("failed to disable write deadline for SSE", "err", err)
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
