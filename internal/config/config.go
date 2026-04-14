@@ -99,7 +99,11 @@ type MCPConfig struct {
 }
 
 type StorageConfig struct {
-	BasePath string `env:"STORAGE_BASE_PATH" envDefault:"./storage"`
+	BasePath       string `env:"STORAGE_BASE_PATH" envDefault:"./storage"`
+	AliyunEndpoint string `env:"ALIYUN_OSS_ENDPOINT"`
+	AliyunBucket   string `env:"ALIYUN_OSS_BUCKET"`
+	AliyunKeyID    string `env:"ALIYUN_OSS_KEY_ID"`
+	AliyunSecret   string `env:"ALIYUN_OSS_KEY_SECRET"`
 }
 
 type FeishuConfig struct {

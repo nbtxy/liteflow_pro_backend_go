@@ -47,9 +47,9 @@ func NewBaseOpenAIProvider(cfg BaseOpenAIConfig) *BaseOpenAIProvider {
 	}
 }
 
-func (p *BaseOpenAIProvider) Name() string           { return p.name }
-func (p *BaseOpenAIProvider) MaxContextTokens() int  { return p.maxTokens }
-func (p *BaseOpenAIProvider) SupportsVision() bool   { return p.vision }
+func (p *BaseOpenAIProvider) Name() string          { return p.name }
+func (p *BaseOpenAIProvider) MaxContextTokens() int { return p.maxTokens }
+func (p *BaseOpenAIProvider) SupportsVision() bool  { return p.vision }
 
 func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<-chan LlmChunk, error) {
 	body := p.buildRequestBody(req, true)
@@ -170,22 +170,20 @@ func (p *BaseOpenAIProvider) buildRequestBody(req *LlmRequest, stream bool) map[
 			"role": msg.Role,
 		}
 
-		if msg.Content != "" {
-			// Handle vision: if images exist, use content array
-			if len(msg.Images) > 0 && msg.Role == "user" {
-				contentParts := []map[string]any{
-					{"type": "text", "text": msg.Content},
-				}
-				for _, img := range msg.Images {
-					contentParts = append(contentParts, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]string{"url": img.ImageURL.URL},
-					})
-				}
-				m["content"] = contentParts
-			} else {
-				m["content"] = msg.Content
+		if len(msg.Images) > 0 && msg.Role == "user" {
+			contentParts := make([]map[string]any, 0, len(msg.Images)+1)
+			if msg.Content != "" {
+				contentParts = append(contentParts, map[string]any{"type": "text", "text": msg.Content})
 			}
+			for _, img := range msg.Images {
+				contentParts = append(contentParts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]string{"url": img.ImageURL.URL},
+				})
+			}
+			m["content"] = contentParts
+		} else if msg.Content != "" {
+			m["content"] = msg.Content
 		}
 
 		if msg.ToolCallID != "" {

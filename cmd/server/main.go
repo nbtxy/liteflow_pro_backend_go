@@ -105,6 +105,24 @@ func main() {
 	usageSvc := usage.NewService(pool)
 	artifactSvc := artifact.NewService(pool)
 	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
+	var ossLinkSvc storage.Service
+	if cfg.Storage.AliyunEndpoint != "" &&
+		cfg.Storage.AliyunBucket != "" &&
+		cfg.Storage.AliyunKeyID != "" &&
+		cfg.Storage.AliyunSecret != "" {
+		ossSvc, err := storage.NewOSS(
+			cfg.Storage.AliyunEndpoint,
+			cfg.Storage.AliyunBucket,
+			cfg.Storage.AliyunKeyID,
+			cfg.Storage.AliyunSecret,
+		)
+		if err != nil {
+			slog.Error("failed to initialize OSS link storage", "err", err)
+			os.Exit(1)
+		}
+		ossLinkSvc = ossSvc
+		slog.Info("OSS link storage enabled for LLM attachments")
+	}
 	memorySvc := memory.NewService(pool)
 	feedbackSvc := feedback.NewService(pool)
 	userSvc := user.NewService(pool)
@@ -136,7 +154,7 @@ func main() {
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()
 	toolDefs := toolRegistry.BuildToolDefinitions()
-	contextAsm := llm.NewContextAssembler(promptEngine, providerRouter, toolDefs)
+	contextAsm := llm.NewContextAssembler(promptEngine, providerRouter, storageSvc, ossLinkSvc, toolDefs)
 
 	// Agent Loop
 	agentLoop := agent.NewAgentLoop(providerRouter, toolRegistry)
