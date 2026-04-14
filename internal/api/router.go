@@ -95,6 +95,7 @@ func NewRouter(app *App) http.Handler {
 	mux.HandleFunc("GET /api/feedbacks/{messageId}", app.FeedbackHandler.GetByMessage)
 
 	// Usage
+	mux.HandleFunc("GET /api/user/usage", app.UsageHandler.GetUserUsage)
 	mux.HandleFunc("GET /api/usage/daily", app.UsageHandler.GetDailySummary)
 	mux.HandleFunc("GET /api/usage/history", app.UsageHandler.GetHistory)
 

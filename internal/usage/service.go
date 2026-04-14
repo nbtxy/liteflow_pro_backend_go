@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,4 +97,112 @@ func (s *Service) GetUserHistory(ctx context.Context, userID uuid.UUID, limit in
 		usages = append(usages, u)
 	}
 	return usages, nil
+}
+
+func (s *Service) GetUserUsage(ctx context.Context, userID uuid.UUID, from, to time.Time) (map[string]any, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT provider, input_tokens, output_tokens, created_at
+		 FROM token_usage
+		 WHERE user_id = $1 AND created_at >= $2 AND created_at <= $3
+		 ORDER BY created_at ASC`,
+		userID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("get user usage: %w", err)
+	}
+	defer rows.Close()
+
+	type providerStats struct {
+		input  int64
+		output int64
+		calls  int64
+		cost   float64
+	}
+	type dailyStats struct {
+		input  int64
+		output int64
+	}
+
+	totalInput := int64(0)
+	totalOutput := int64(0)
+	totalCalls := int64(0)
+	totalCost := 0.0
+	byProvider := map[string]*providerStats{}
+	byDay := map[string]*dailyStats{}
+
+	for rows.Next() {
+		var provider string
+		var inputTokens, outputTokens int64
+		var createdAt time.Time
+		if err := rows.Scan(&provider, &inputTokens, &outputTokens, &createdAt); err != nil {
+			return nil, err
+		}
+
+		totalInput += inputTokens
+		totalOutput += outputTokens
+		totalCalls++
+
+		cost := EstimateCost(provider, int(inputTokens), int(outputTokens))
+		totalCost += cost
+
+		ps := byProvider[provider]
+		if ps == nil {
+			ps = &providerStats{}
+			byProvider[provider] = ps
+		}
+		ps.input += inputTokens
+		ps.output += outputTokens
+		ps.calls++
+		ps.cost += cost
+
+		dayKey := createdAt.Local().Format("2006-01-02")
+		ds := byDay[dayKey]
+		if ds == nil {
+			ds = &dailyStats{}
+			byDay[dayKey] = ds
+		}
+		ds.input += inputTokens
+		ds.output += outputTokens
+	}
+
+	byProviderResp := map[string]any{}
+	for provider, stats := range byProvider {
+		byProviderResp[provider] = map[string]any{
+			"inputTokens":   stats.input,
+			"outputTokens":  stats.output,
+			"apiCalls":      stats.calls,
+			"estimatedCost": fmt.Sprintf("$%.4f", stats.cost),
+		}
+	}
+
+	dayKeys := make([]string, 0, len(byDay))
+	for k := range byDay {
+		dayKeys = append(dayKeys, k)
+	}
+	sort.Strings(dayKeys)
+
+	daily := make([]map[string]any, 0, len(dayKeys))
+	for _, day := range dayKeys {
+		stats := byDay[day]
+		daily = append(daily, map[string]any{
+			"date":         day,
+			"inputTokens":  stats.input,
+			"outputTokens": stats.output,
+		})
+	}
+
+	return map[string]any{
+		"period": map[string]any{
+			"from": from.Format(time.RFC3339),
+			"to":   to.Format(time.RFC3339),
+		},
+		"total": map[string]any{
+			"inputTokens":   totalInput,
+			"outputTokens":  totalOutput,
+			"totalTokens":   totalInput + totalOutput,
+			"apiCalls":      totalCalls,
+			"estimatedCost": fmt.Sprintf("$%.4f", totalCost),
+		},
+		"byProvider": byProviderResp,
+		"daily":      daily,
+	}, nil
 }
