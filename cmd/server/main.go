@@ -162,7 +162,6 @@ func main() {
 	toolRegistry := tool.NewRegistry()
 	toolRegistry.Register(tool.NewCalculator())
 	toolRegistry.Register(tool.NewCurrentTime())
-	toolRegistry.Register(tool.NewWebFetch())
 	toolRegistry.Register(tool.NewWebSearch(searchRouter))
 	toolRegistry.Register(tool.NewActiveMCP(mcpSvc.ActivateByPlatform))
 	toolRegistry.Register(tool.NewMemoryManage(memorySvc.ManageTool))
@@ -173,6 +172,7 @@ func main() {
 	toolRegistry.Register(tool.NewReadFile(storageSvc))
 	toolRegistry.Register(tool.NewListFiles(artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewDeleteFile(artifactSvc.DeleteByPath))
+	toolRegistry.Register(tool.NewHttpRequest())
 
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()
