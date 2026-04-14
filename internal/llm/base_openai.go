@@ -9,7 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 // BaseOpenAIProvider implements common OpenAI-compatible streaming logic.
@@ -58,6 +61,7 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	p.persistRequest("stream", jsonBody)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
@@ -125,6 +129,7 @@ func (p *BaseOpenAIProvider) Chat(ctx context.Context, req *LlmRequest) (*LlmRes
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	p.persistRequest("chat", jsonBody)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
@@ -281,6 +286,43 @@ func (p *BaseOpenAIProvider) extractResponse(raw *openAIResponse) *LlmResponse {
 	}
 
 	return resp
+}
+
+func (p *BaseOpenAIProvider) persistRequest(mode string, jsonBody []byte) {
+	enabled := strings.TrimSpace(strings.ToLower(os.Getenv("LLM_SAVE_REQUEST_ENABLED")))
+	if enabled == "0" || enabled == "false" || enabled == "no" {
+		return
+	}
+
+	dir := strings.TrimSpace(os.Getenv("LLM_SAVE_REQUEST_DIR"))
+	if dir == "" {
+		dir = "./storage/llm_requests"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("failed to create llm request dir", "dir", dir, "err", err)
+		return
+	}
+
+	record := map[string]any{
+		"saved_at":  time.Now().Format(time.RFC3339Nano),
+		"provider":  p.name,
+		"endpoint":  p.endpoint,
+		"mode":      mode,
+		"request":   json.RawMessage(jsonBody),
+		"api_key":   "<redacted>",
+		"auth_mode": "bearer",
+	}
+	content, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		slog.Warn("failed to marshal llm request record", "err", err)
+		return
+	}
+
+	fileName := fmt.Sprintf("%s_%s_%d.json", p.name, mode, time.Now().UnixNano())
+	filePath := filepath.Join(dir, fileName)
+	if err := os.WriteFile(filePath, content, 0o644); err != nil {
+		slog.Warn("failed to persist llm request", "path", filePath, "err", err)
+	}
 }
 
 // OpenAI API response structures

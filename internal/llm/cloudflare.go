@@ -18,7 +18,7 @@ func NewCloudflareProvider(cfg config.CloudflareConfig) *BaseOpenAIProvider {
 		Endpoint:  cfg.Endpoint,
 		Model:     model,
 		MaxTokens: 8000,
-		Vision:    false,
+		Vision:    true,
 		Headers:   headers,
 	})
 }
