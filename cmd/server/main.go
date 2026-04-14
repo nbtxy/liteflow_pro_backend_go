@@ -102,10 +102,10 @@ func main() {
 	}
 
 	// Services
-	convSvc := conversation.NewService(pool)
+	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
+	convSvc := conversation.NewService(pool, storageSvc)
 	usageSvc := usage.NewService(pool)
 	artifactSvc := artifact.NewService(pool)
-	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
 	searchRouter := platformsearch.NewProviderRouter(cfg.Search.Provider)
 	if cfg.Search.Metaso.APIKey != "" {
 		searchRouter.Register(platformsearch.NewMetaso(

@@ -2,22 +2,29 @@ package conversation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/liteflow/backend/internal/domain"
+	"github.com/liteflow/backend/internal/platform/storage"
 )
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	storageSvc storage.Service
 }
 
-func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+func NewService(pool *pgxpool.Pool, storageSvc storage.Service) *Service {
+	return &Service{
+		pool:       pool,
+		storageSvc: storageSvc,
+	}
 }
 
 func (s *Service) Create(ctx context.Context, userID uuid.UUID) (*domain.Conversation, error) {
@@ -156,6 +163,14 @@ func (s *Service) Delete(ctx context.Context, id, userID uuid.UUID) error {
 	}
 	defer tx.Rollback(ctx)
 
+	var filePaths []string
+	if s.storageSvc != nil {
+		filePaths, err = s.listConversationFilePathsTx(ctx, tx, id)
+		if err != nil {
+			return fmt.Errorf("list conversation files: %w", err)
+		}
+	}
+
 	_, err = tx.Exec(ctx, `DELETE FROM messages WHERE conversation_id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("delete messages: %w", err)
@@ -167,7 +182,63 @@ func (s *Service) Delete(ctx context.Context, id, userID uuid.UUID) error {
 		return fmt.Errorf("delete conversation: %w", err)
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	s.cleanupConversationFiles(ctx, id, filePaths)
+	return nil
+}
+
+func (s *Service) listConversationFilePathsTx(ctx context.Context, tx pgx.Tx, conversationID uuid.UUID) ([]string, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT file_path
+		 FROM artifacts
+		 WHERE conversation_id = $1 AND file_path <> ''`,
+		conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	paths := make([]string, 0, 8)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+func (s *Service) cleanupConversationFiles(ctx context.Context, conversationID uuid.UUID, filePaths []string) {
+	if s.storageSvc == nil {
+		return
+	}
+
+	if cleaner, ok := s.storageSvc.(interface {
+		DeleteConversation(context.Context, string) error
+	}); ok {
+		if err := cleaner.DeleteConversation(ctx, conversationID.String()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("failed to cleanup conversation directory",
+				"conversationId", conversationID.String(),
+				"err", err)
+		}
+		return
+	}
+
+	for _, path := range filePaths {
+		if path == "" {
+			continue
+		}
+		if err := s.storageSvc.DeleteFile(ctx, conversationID.String(), path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("failed to delete conversation file",
+				"conversationId", conversationID.String(),
+				"path", path,
+				"err", err)
+		}
+	}
 }
 
 func (s *Service) GetMessages(ctx context.Context, conversationID uuid.UUID) ([]domain.Message, error) {
