@@ -28,6 +28,7 @@ import (
 	"github.com/liteflow/backend/internal/mcp"
 	"github.com/liteflow/backend/internal/memory"
 	"github.com/liteflow/backend/internal/platform/postgres"
+	platformsearch "github.com/liteflow/backend/internal/platform/search"
 	"github.com/liteflow/backend/internal/platform/sms"
 	"github.com/liteflow/backend/internal/platform/storage"
 	"github.com/liteflow/backend/internal/skill"
@@ -105,6 +106,23 @@ func main() {
 	usageSvc := usage.NewService(pool)
 	artifactSvc := artifact.NewService(pool)
 	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
+	searchRouter := platformsearch.NewProviderRouter(cfg.Search.Provider)
+	if cfg.Search.Metaso.APIKey != "" {
+		searchRouter.Register(platformsearch.NewMetaso(
+			cfg.Search.Metaso.APIKey,
+			cfg.Search.Metaso.Endpoint,
+			cfg.Search.Metaso.Timeout,
+			cfg.Search.Metaso.Count,
+		))
+	}
+	if cfg.Search.Tavily.APIKey != "" {
+		searchRouter.Register(platformsearch.NewTavily(
+			cfg.Search.Tavily.APIKey,
+			cfg.Search.Tavily.Endpoint,
+			cfg.Search.Tavily.Timeout,
+			cfg.Search.Tavily.Count,
+		))
+	}
 	var ossLinkSvc storage.Service
 	if cfg.Storage.AliyunEndpoint != "" &&
 		cfg.Storage.AliyunBucket != "" &&
@@ -145,7 +163,7 @@ func main() {
 	toolRegistry.Register(tool.NewCalculator())
 	toolRegistry.Register(tool.NewCurrentTime())
 	toolRegistry.Register(tool.NewWebFetch())
-	toolRegistry.Register(tool.NewWebSearch())
+	toolRegistry.Register(tool.NewWebSearch(searchRouter))
 	toolRegistry.Register(tool.NewActiveMCP(mcpSvc.ActivateByPlatform))
 	toolRegistry.Register(tool.NewMemoryManage(memorySvc.ManageTool))
 	toolRegistry.Register(tool.NewSearchSkill(skillRegistry.Search))
