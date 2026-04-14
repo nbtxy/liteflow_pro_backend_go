@@ -29,6 +29,7 @@ import (
 	"github.com/liteflow/backend/internal/memory"
 	"github.com/liteflow/backend/internal/platform/postgres"
 	"github.com/liteflow/backend/internal/platform/sms"
+	"github.com/liteflow/backend/internal/platform/storage"
 	"github.com/liteflow/backend/internal/skill"
 	taskpkg "github.com/liteflow/backend/internal/task"
 	"github.com/liteflow/backend/internal/tool"
@@ -103,6 +104,7 @@ func main() {
 	convSvc := conversation.NewService(pool)
 	usageSvc := usage.NewService(pool)
 	artifactSvc := artifact.NewService(pool)
+	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
 	memorySvc := memory.NewService(pool)
 	feedbackSvc := feedback.NewService(pool)
 	userSvc := user.NewService(pool)
@@ -191,7 +193,7 @@ func main() {
 		AuthHandler:     api.NewAuthHandler(authSvc),
 		ChatHandler:     api.NewChatHandler(chatSvc),
 		ConvHandler:     api.NewConversationHandler(convSvc),
-		ArtifactHandler: api.NewArtifactHandler(artifactSvc),
+		ArtifactHandler: api.NewArtifactHandler(artifactSvc, storageSvc),
 		MemoryHandler:   api.NewMemoryHandler(memorySvc),
 		UserHandler:     api.NewUserHandler(userSvc),
 		FeedbackHandler: api.NewFeedbackHandler(feedbackSvc),

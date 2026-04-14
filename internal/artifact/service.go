@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -142,6 +143,15 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+func (s *Service) DeleteByPath(ctx context.Context, conversationID uuid.UUID, filePath string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE artifacts
+		 SET file_deleted = true
+		 WHERE conversation_id = $1 AND file_path = $2`,
+		conversationID, filePath)
+	return err
+}
+
 func (s *Service) CreateFileArtifact(ctx context.Context, conversationID, messageID uuid.UUID,
 	path, content string) (map[string]any, error) {
 
@@ -159,6 +169,7 @@ func (s *Service) CreateFileArtifact(ctx context.Context, conversationID, messag
 		FilePath:       path,
 		Type:           string(domain.ArtifactTypeFile),
 		Version:        1,
+		Metadata:       json.RawMessage(`{"source":"generated"}`),
 		CreatedAt:      time.Now(),
 	}
 
@@ -183,6 +194,11 @@ func (s *Service) CreateFileArtifact(ctx context.Context, conversationID, messag
 		"title":       path,
 		"version":     newArtifact.Version,
 		"file_size":   fileSize,
-		"parent_id":   func() string { if newArtifact.ParentID != nil { return newArtifact.ParentID.String() }; return "" }(),
+		"parent_id": func() string {
+			if newArtifact.ParentID != nil {
+				return newArtifact.ParentID.String()
+			}
+			return ""
+		}(),
 	}, nil
 }

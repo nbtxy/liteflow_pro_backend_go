@@ -18,6 +18,22 @@ func NewConversationHandler(convSvc *conversation.Service) *ConversationHandler 
 	return &ConversationHandler{convSvc: convSvc}
 }
 
+func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
+	userID, err := auth.GetUserID(r.Context())
+	if err != nil {
+		Unauthorized(w, "unauthorized")
+		return
+	}
+
+	conv, err := h.convSvc.Create(r.Context(), userID)
+	if err != nil {
+		InternalError(w, "failed to create conversation")
+		return
+	}
+
+	OK(w, conv)
+}
+
 func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
 	userID, err := auth.GetUserID(r.Context())
 	if err != nil {

@@ -10,14 +10,15 @@ type Config struct {
 	SuperAdminPhone string   `env:"SUPER_ADMIN_PHONE" envDefault:"13426112101"`
 	DebugEnabled    bool     `env:"DEBUG_ENABLED" envDefault:"true"`
 
-	DB     DBConfig
-	JWT    JWTConfig
-	SMS    SMSConfig
-	Search SearchConfig
-	LLM    LLMConfig
-	MCP    MCPConfig
-	Feishu FeishuConfig
-	Tasks  TasksConfig
+	DB      DBConfig
+	JWT     JWTConfig
+	SMS     SMSConfig
+	Search  SearchConfig
+	LLM     LLMConfig
+	MCP     MCPConfig
+	Storage StorageConfig
+	Feishu  FeishuConfig
+	Tasks   TasksConfig
 }
 
 type DBConfig struct {
@@ -95,6 +96,10 @@ type MCPConfig struct {
 	SupabaseClientID     string `env:"MCP_OAUTH_SUPABASE_CLIENT_ID"`
 	SupabaseClientSecret string `env:"MCP_OAUTH_SUPABASE_CLIENT_SECRET"`
 	SupabaseScope        string `env:"MCP_OAUTH_SUPABASE_SCOPE" envDefault:"all"`
+}
+
+type StorageConfig struct {
+	BasePath string `env:"STORAGE_BASE_PATH" envDefault:"./storage"`
 }
 
 type FeishuConfig struct {
