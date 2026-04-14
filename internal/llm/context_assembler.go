@@ -209,27 +209,31 @@ func buildLlmMessage(
 					if fileName == "" {
 						fileName = a.Name
 					}
-					publicURL := resolveAttachmentURL(conversationID, a.URL, fileName, storageSvc, ossLinkSvc)
-					if publicURL == "" {
-						continue
+					if fileName == "" {
+						fileName = "file"
 					}
 
+					// Only generate URL when model can actually consume image URLs.
 					if a.Type == "image" && visionSupported {
-						images = append(images, ImageContent{
-							Type:     "image_url",
-							ImageURL: &ImageURL{URL: publicURL},
-						})
-						continue
+						publicURL := resolveAttachmentURL(conversationID, a.URL, fileName, storageSvc, ossLinkSvc)
+						if publicURL != "" {
+							images = append(images, ImageContent{
+								Type:     "image_url",
+								ImageURL: &ImageURL{URL: publicURL},
+							})
+							continue
+						}
 					}
 
 					label := "附件"
 					if a.Type == "image" {
 						label = "图片附件"
 					}
-					if fileName == "" {
-						fileName = "file"
+					fileInfo := fmt.Sprintf("%s: %s", label, fileName)
+					if a.Type != "" {
+						fileInfo += fmt.Sprintf(" (type=%s)", a.Type)
 					}
-					textParts = append(textParts, fmt.Sprintf("[%s: %s](%s)", label, fileName, publicURL))
+					textParts = append(textParts, fileInfo)
 				}
 
 				combinedContent := content

@@ -171,6 +171,7 @@ func main() {
 	toolRegistry.Register(tool.NewStrReplace(storageSvc, artifactSvc.CreateFileArtifact))
 	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
+	toolRegistry.Register(tool.NewDownloadFile(storageSvc, artifactSvc.CreateFileArtifact))
 
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()

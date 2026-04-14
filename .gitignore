@@ -6,6 +6,7 @@
 *.dylib
 /server
 /cmd/server/server
+/cmd/server/__debug*
 /storage/*
 
 # Environment
