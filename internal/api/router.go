@@ -21,7 +21,6 @@ type App struct {
 	FeedbackHandler *FeedbackHandler
 	UsageHandler    *UsageHandler
 	AdminHandler    *AdminHandler
-	OssHandler      *OssHandler
 	SkillHandler    *SkillHandler
 	TaskHandler     *TaskHandler
 	ChannelHandler  *ChannelHandler
@@ -119,9 +118,6 @@ func NewRouter(app *App) http.Handler {
 	mux.HandleFunc("GET /api/channels", app.ChannelHandler.List)
 	mux.HandleFunc("GET /api/channels/{id}", app.ChannelHandler.Get)
 	mux.HandleFunc("DELETE /api/channels/{id}", app.ChannelHandler.Delete)
-
-	// OSS
-	mux.HandleFunc("GET /api/oss/sts", app.OssHandler.GetSTSCredentials)
 
 	// Admin
 	mux.HandleFunc("GET /api/admin/users", app.AdminHandler.ListUsers)

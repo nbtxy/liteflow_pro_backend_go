@@ -29,7 +29,6 @@ import (
 	"github.com/liteflow/backend/internal/memory"
 	"github.com/liteflow/backend/internal/platform/postgres"
 	"github.com/liteflow/backend/internal/platform/sms"
-	"github.com/liteflow/backend/internal/platform/storage"
 	"github.com/liteflow/backend/internal/skill"
 	taskpkg "github.com/liteflow/backend/internal/task"
 	"github.com/liteflow/backend/internal/tool"
@@ -84,17 +83,6 @@ func main() {
 	// JWT & Auth
 	jwtSvc := auth.NewJwtService(cfg.JWT)
 	authSvc := auth.NewAuthService(pool, jwtSvc, smsSvc, cfg.JWT, cfg.SuperAdminPhone)
-
-	// Storage
-	var storageSvc storage.Service
-	var stsSvc *storage.OssStsService
-	if cfg.Storage.Type == "oss" {
-		storageSvc = storage.NewOSS(cfg.Storage.OSS)
-		stsSvc = storage.NewOssSts(cfg.Storage.OSS)
-	} else {
-		storageSvc = storage.NewLocal(cfg.Storage.LocalPath)
-	}
-	_ = storageSvc
 
 	// LLM Providers
 	providerRouter := llm.NewProviderRouter(cfg.LLM.DefaultProvider)
@@ -209,7 +197,6 @@ func main() {
 		FeedbackHandler: api.NewFeedbackHandler(feedbackSvc),
 		UsageHandler:    api.NewUsageHandler(usageSvc),
 		AdminHandler:    api.NewAdminHandler(adminSvc),
-		OssHandler:      api.NewOssHandler(stsSvc),
 		SkillHandler:    api.NewSkillHandler(skillRegistry),
 		TaskHandler:     api.NewTaskHandler(taskScheduler, taskExecutor),
 		ChannelHandler:  api.NewChannelHandler(channelMgr, oauthSvc),
