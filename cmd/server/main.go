@@ -168,10 +168,8 @@ func main() {
 	toolRegistry.Register(tool.NewSearchSkill(skillRegistry.Search))
 	toolRegistry.Register(tool.NewManageScheduledTask(taskScheduler.ManageTool))
 	toolRegistry.Register(tool.NewCreateFile(storageSvc, artifactSvc.CreateFileArtifact))
-	toolRegistry.Register(tool.NewEditFile(storageSvc, artifactSvc.CreateFileArtifact))
-	toolRegistry.Register(tool.NewReadFile(storageSvc))
-	toolRegistry.Register(tool.NewListFiles(artifactSvc.GetLatestArtifacts))
-	toolRegistry.Register(tool.NewDeleteFile(artifactSvc.DeleteByPath))
+	toolRegistry.Register(tool.NewStrReplace(storageSvc, artifactSvc.CreateFileArtifact))
+	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
 
 	// Context Assembler

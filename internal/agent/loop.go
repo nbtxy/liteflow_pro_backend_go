@@ -367,7 +367,7 @@ func buildSingleArtifactEvent(meta map[string]any, toolName string, input map[st
 	title := ""
 	if t, ok := meta["title"].(string); ok {
 		title = t
-	} else if toolName == "create_file" || toolName == "edit_file" {
+	} else if toolName == "create_file" || toolName == "str_replace" {
 		if p, ok := input["path"].(string); ok {
 			title = p
 		}
