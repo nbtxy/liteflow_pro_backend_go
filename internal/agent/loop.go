@@ -16,7 +16,7 @@ import (
 const (
 	MaxIterations = 20
 	ToolTimeout   = 30 * time.Second
-	MaxToolResult = 2000
+	MaxToolResult = 200000
 )
 
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string) ([]tool.Tool, error)
