@@ -466,18 +466,22 @@ func (m *Manager) discoverAndSaveTools(ctx context.Context, channelID, userID uu
 		refreshToken, _ = config["refresh_token"].(string)
 	}
 	expiresAt, _ := config["expiresAt"].(string)
+	oauthClientID, _ := config["oauthClientId"].(string)
+	oauthClientSecret, _ := config["oauthClientSecret"].(string)
 
 	if serverURL == "" {
 		return 0, fmt.Errorf("serverUrl is required")
 	}
 
 	cfg := mcp.ServerConfig{
-		ChannelID:      channelID,
-		ServerURL:      serverURL,
-		Token:          token,
-		RefreshToken:   refreshToken,
-		Provider:       provider,
-		TokenExpiresAt: expiresAt,
+		ChannelID:         channelID,
+		ServerURL:         serverURL,
+		Token:             token,
+		RefreshToken:      refreshToken,
+		Provider:          provider,
+		TokenExpiresAt:    expiresAt,
+		OAuthClientID:     oauthClientID,
+		OAuthClientSecret: oauthClientSecret,
 	}
 	tools, err := m.mcpClient.ListTools(ctx, cfg)
 	if err != nil {

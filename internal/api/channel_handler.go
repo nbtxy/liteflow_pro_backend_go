@@ -342,6 +342,12 @@ func (h *ChannelHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		"token":     tokenSet.AccessToken,
 		"provider":  body.Provider,
 	}
+	if tokenSet.OAuthClientID != "" {
+		config["oauthClientId"] = tokenSet.OAuthClientID
+	}
+	if tokenSet.OAuthClientSecret != "" {
+		config["oauthClientSecret"] = tokenSet.OAuthClientSecret
+	}
 	if tokenSet.RefreshToken != "" {
 		config["refreshToken"] = tokenSet.RefreshToken
 	}

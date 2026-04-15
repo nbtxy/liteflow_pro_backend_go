@@ -45,12 +45,24 @@ func ToolUseInputEvent(toolUseID string, input map[string]any) Event {
 	})
 }
 
-func ToolResultEvent(toolUseID, status, content string) Event {
-	return NewEvent(EventToolResult, map[string]any{
+func ToolResultEvent(toolUseID, status, content string, metadata map[string]any) Event {
+	data := map[string]any{
 		"toolUseId": toolUseID,
 		"status":    status,
 		"content":   content,
-	})
+	}
+	if metadata != nil {
+		if mode, ok := metadata["mcp_mode"]; ok {
+			data["mcp_mode"] = mode
+		}
+		if activated, ok := metadata["activated_tools"]; ok {
+			data["activated_tools"] = activated
+		}
+		if sourceMessageID, ok := metadata["source_message_id"]; ok {
+			data["source_message_id"] = sourceMessageID
+		}
+	}
+	return NewEvent(EventToolResult, data)
 }
 
 func ErrorEvent(code, message string) Event {

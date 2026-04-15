@@ -30,10 +30,12 @@ type OAuthService struct {
 }
 
 type oauthStateEntry struct {
-	UserID    uuid.UUID
-	Provider  string
-	ServerURL string
-	CreatedAt time.Time
+	UserID       uuid.UUID
+	Provider     string
+	ServerURL    string
+	ClientID     string
+	ClientSecret string
+	CreatedAt    time.Time
 }
 
 func (e *oauthStateEntry) isExpired() bool {
@@ -57,9 +59,11 @@ type dynamicClientInfo struct {
 }
 
 type OAuthTokenSet struct {
-	AccessToken  string
-	RefreshToken string
-	ExpiresIn    int64
+	AccessToken       string
+	RefreshToken      string
+	ExpiresIn         int64
+	OAuthClientID     string
+	OAuthClientSecret string
 }
 
 func NewOAuthService(cfg config.MCPConfig) *OAuthService {
@@ -125,21 +129,8 @@ func (s *OAuthService) GenerateAuthURL(userID uuid.UUID, provider, serverURL str
 	}
 
 	state = uuid.NewString()
-
-	s.states.Store(state, &oauthStateEntry{
-		UserID:    userID,
-		Provider:  provider,
-		ServerURL: serverURL,
-		CreatedAt: time.Now(),
-	})
-
-	// PKCE
-	codeVerifier := generateCodeVerifier()
-	codeChallenge := generateCodeChallenge(codeVerifier)
-	s.pkceStore.Store(state, codeVerifier)
-
 	clientID := pcfg.ClientID
-
+	clientSecret := pcfg.ClientSecret
 	// Dynamic client registration for MCP OAuth 2.1 providers
 	if pcfg.IsDynamic {
 		dci, err := s.ensureDynamicClient(provider, pcfg)
@@ -147,7 +138,22 @@ func (s *OAuthService) GenerateAuthURL(userID uuid.UUID, provider, serverURL str
 			return "", "", fmt.Errorf("动态客户端注册失败: %w", err)
 		}
 		clientID = dci.ClientID
+		clientSecret = dci.ClientSecret
 	}
+
+	s.states.Store(state, &oauthStateEntry{
+		UserID:       userID,
+		Provider:     provider,
+		ServerURL:    serverURL,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		CreatedAt:    time.Now(),
+	})
+
+	// PKCE
+	codeVerifier := generateCodeVerifier()
+	codeChallenge := generateCodeChallenge(codeVerifier)
+	s.pkceStore.Store(state, codeVerifier)
 
 	params := url.Values{}
 	params.Set("client_id", clientID)
@@ -177,6 +183,7 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 		return OAuthTokenSet{}, fmt.Errorf("不支持该服务的 OAuth 授权")
 	}
 
+	var stateEntry *oauthStateEntry
 	if state != "" {
 		val, loaded := s.states.LoadAndDelete(state)
 		if !loaded {
@@ -189,6 +196,7 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 		if entry.Provider != provider {
 			return OAuthTokenSet{}, fmt.Errorf("授权提供者不匹配")
 		}
+		stateEntry = entry
 	}
 
 	form := url.Values{}
@@ -200,10 +208,25 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 
 	if pcfg.IsDynamic {
 		// MCP OAuth 2.1: use dynamic client credentials + PKCE
-		if dci, ok := s.dynamicClients.Load(provider); ok {
-			dc := dci.(*dynamicClientInfo)
-			form.Set("client_id", dc.ClientID)
-			basic := base64.StdEncoding.EncodeToString([]byte(dc.ClientID + ":" + dc.ClientSecret))
+		clientID := ""
+		clientSecret := ""
+		if stateEntry != nil {
+			clientID = stateEntry.ClientID
+			clientSecret = stateEntry.ClientSecret
+		}
+		if clientID == "" {
+			if dci, ok := s.dynamicClients.Load(provider); ok {
+				dc := dci.(*dynamicClientInfo)
+				clientID = dc.ClientID
+				clientSecret = dc.ClientSecret
+			}
+		}
+		if clientID == "" {
+			return OAuthTokenSet{}, fmt.Errorf("缺少动态客户端信息，请重新授权")
+		}
+		form.Set("client_id", clientID)
+		if clientSecret != "" {
+			basic := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
 			authHeader = "Basic " + basic
 		}
 	} else if provider == "supabase" {
@@ -254,11 +277,17 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 	if err != nil {
 		return OAuthTokenSet{}, err
 	}
+	if pcfg.IsDynamic {
+		if stateEntry != nil && stateEntry.ClientID != "" {
+			tokenSet.OAuthClientID = stateEntry.ClientID
+			tokenSet.OAuthClientSecret = stateEntry.ClientSecret
+		}
+	}
 	slog.Info("OAuth token received", "provider", provider, "token_len", len(tokenSet.AccessToken))
 	return tokenSet, nil
 }
 
-func (s *OAuthService) RefreshAccessToken(ctx context.Context, provider, refreshToken string) (OAuthTokenSet, error) {
+func (s *OAuthService) RefreshAccessToken(ctx context.Context, provider, refreshToken, oauthClientID, oauthClientSecret string) (OAuthTokenSet, error) {
 	if refreshToken == "" {
 		return OAuthTokenSet{}, fmt.Errorf("refresh_token 为空")
 	}
@@ -273,23 +302,22 @@ func (s *OAuthService) RefreshAccessToken(ctx context.Context, provider, refresh
 
 	var authHeader string
 	if pcfg.IsDynamic {
-		if dci, ok := s.dynamicClients.Load(provider); ok {
-			dc := dci.(*dynamicClientInfo)
-			form.Set("client_id", dc.ClientID)
-			if dc.ClientSecret != "" {
-				basic := base64.StdEncoding.EncodeToString([]byte(dc.ClientID + ":" + dc.ClientSecret))
-				authHeader = "Basic " + basic
+		clientID := oauthClientID
+		clientSecret := oauthClientSecret
+		if clientID == "" {
+			if dci, ok := s.dynamicClients.Load(provider); ok {
+				dc := dci.(*dynamicClientInfo)
+				clientID = dc.ClientID
+				clientSecret = dc.ClientSecret
 			}
-		} else {
-			dci, err := s.ensureDynamicClient(provider, pcfg)
-			if err != nil {
-				return OAuthTokenSet{}, fmt.Errorf("动态客户端注册失败: %w", err)
-			}
-			form.Set("client_id", dci.ClientID)
-			if dci.ClientSecret != "" {
-				basic := base64.StdEncoding.EncodeToString([]byte(dci.ClientID + ":" + dci.ClientSecret))
-				authHeader = "Basic " + basic
-			}
+		}
+		if clientID == "" {
+			return OAuthTokenSet{}, fmt.Errorf("缺少 OAuth 客户端信息，请重新授权")
+		}
+		form.Set("client_id", clientID)
+		if clientSecret != "" {
+			basic := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
+			authHeader = "Basic " + basic
 		}
 	} else if provider == "supabase" {
 		basic := base64.StdEncoding.EncodeToString([]byte(pcfg.ClientID + ":" + pcfg.ClientSecret))
@@ -340,10 +368,7 @@ func (s *OAuthService) RefreshAccessToken(ctx context.Context, provider, refresh
 // ensureDynamicClient performs MCP OAuth 2.1 dynamic client registration if needed.
 func (s *OAuthService) ensureDynamicClient(provider string, pcfg *providerConfig) (*dynamicClientInfo, error) {
 	if cached, ok := s.dynamicClients.Load(provider); ok {
-		dc := cached.(*dynamicClientInfo)
-		if time.Since(dc.RegisteredAt) < time.Hour {
-			return dc, nil
-		}
+		return cached.(*dynamicClientInfo), nil
 	}
 
 	regBody := map[string]any{

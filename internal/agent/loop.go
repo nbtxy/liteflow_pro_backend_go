@@ -20,6 +20,10 @@ const (
 )
 
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string) ([]tool.Tool, error)
+type ExecuteOptions struct {
+	MCPMode        string
+	ActivatedTools []string
+}
 
 type AgentLoop struct {
 	providerRouter *llm.ProviderRouter
@@ -45,22 +49,41 @@ type toolCallAccumulator struct {
 }
 
 func (a *AgentLoop) Execute(ctx context.Context, req *llm.LlmRequest,
-	toolCtx *tool.ToolContext, usageAcc *llm.LlmUsage) <-chan Event {
+	toolCtx *tool.ToolContext, usageAcc *llm.LlmUsage, opts *ExecuteOptions) <-chan Event {
 
 	events := make(chan Event, 64)
 	go func() {
 		defer close(events)
-		a.run(ctx, req, toolCtx, usageAcc, events)
+		a.run(ctx, req, toolCtx, usageAcc, events, opts)
 	}()
 	return events
 }
 
 func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
-	toolCtx *tool.ToolContext, usageAcc *llm.LlmUsage, events chan<- Event) {
+	toolCtx *tool.ToolContext, usageAcc *llm.LlmUsage, events chan<- Event, opts *ExecuteOptions) {
 
 	normalTools := req.Tools
 	activatedMcpTools := make(map[string]tool.Tool)
 	mcpModeActive := false
+	if opts != nil && strings.EqualFold(opts.MCPMode, "active") && len(opts.ActivatedTools) > 0 {
+		if a.mcpExecBuilder != nil && toolCtx.UserID != uuid.Nil {
+			executors, err := a.mcpExecBuilder(ctx, toolCtx.UserID.String(), opts.ActivatedTools)
+			if err != nil {
+				slog.Warn("failed to restore MCP executors", "err", err)
+			} else {
+				for _, exec := range executors {
+					activatedMcpTools[exec.Name()] = exec
+				}
+			}
+		}
+		if len(activatedMcpTools) > 0 {
+			inactiveTool := tool.NewInactiveMCP()
+			activatedMcpTools[inactiveTool.Name()] = inactiveTool
+			req.Tools = a.buildMcpActiveToolDefs(normalTools, activatedMcpTools)
+			mcpModeActive = true
+			slog.Info("restored MCP active mode", "mcpToolCount", len(activatedMcpTools))
+		}
+	}
 
 	for iteration := 0; iteration < MaxIterations; iteration++ {
 		if ctx.Err() != nil {
@@ -113,9 +136,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 					}
 				}
 				if activated, ok := result.Metadata["activated_tools"]; ok {
-					if names, ok := activated.([]string); ok {
-						newlyActivated = append(newlyActivated, names...)
-					}
+					newlyActivated = append(newlyActivated, parseStringSlice(activated)...)
 				}
 			}
 		}
@@ -315,7 +336,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		"durationMs", durationMs,
 	)
 
-	events = append(events, ToolResultEvent(tc.id, status, resultContent))
+	events = append(events, ToolResultEvent(tc.id, status, resultContent, result.Metadata))
 
 	if result.Metadata != nil {
 		if artifactEvents := buildArtifactEvents(result.Metadata, tc.name, input); len(artifactEvents) > 0 {
@@ -408,4 +429,21 @@ func truncateToolResult(content string) string {
 		return content[:MaxToolResult] + "\n... [结果已截断]"
 	}
 	return content
+}
+
+func parseStringSlice(v any) []string {
+	if names, ok := v.([]string); ok {
+		return names
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok && s != "" {
+			result = append(result, s)
+		}
+	}
+	return result
 }

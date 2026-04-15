@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -397,4 +398,115 @@ func (s *Service) ClearMessages(ctx context.Context, conversationID, userID uuid
 
 	slog.Info("cleared messages", "conversationId", conversationID)
 	return nil
+}
+
+type MCPState struct {
+	Mode            string   `json:"mode"`
+	ActivatedTools  []string `json:"activated_tools"`
+	SourceMessageID *string  `json:"source_message_id,omitempty"`
+}
+
+func (s *Service) GetMCPState(ctx context.Context, conversationID, userID uuid.UUID) (*MCPState, error) {
+	var raw []byte
+
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(mcp_state, '{"mode":"inactive","activated_tools":[]}'::jsonb)
+		 FROM conversations
+		 WHERE id = $1 AND user_id = $2`,
+		conversationID, userID).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := decodeMCPState(raw)
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (s *Service) GetMCPStateWithPrev(ctx context.Context, conversationID, userID uuid.UUID) (*MCPState, *MCPState, error) {
+	var currentRaw []byte
+	var prevRaw []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(mcp_state, '{"mode":"inactive","activated_tools":[]}'::jsonb),
+		        mcp_prev_state
+		 FROM conversations
+		 WHERE id = $1 AND user_id = $2`,
+		conversationID, userID).Scan(&currentRaw, &prevRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	currentState, err := decodeMCPState(currentRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(prevRaw) == 0 {
+		return currentState, nil, nil
+	}
+
+	prevState, err := decodeMCPState(prevRaw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode mcp_prev_state: %w", err)
+	}
+	return currentState, prevState, nil
+}
+
+func (s *Service) SetMCPState(ctx context.Context, conversationID, userID uuid.UUID, state *MCPState) error {
+	state = normalizeMCPState(state)
+	if state.SourceMessageID != nil && *state.SourceMessageID != "" {
+		if _, err := uuid.Parse(*state.SourceMessageID); err != nil {
+			return fmt.Errorf("invalid source_message_id: %w", err)
+		}
+	}
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encode mcp_state: %w", err)
+	}
+
+	cmd, err := s.pool.Exec(ctx,
+		`UPDATE conversations
+		 SET mcp_prev_state = mcp_state,
+		     mcp_state = $1
+		 WHERE id = $2 AND user_id = $3`,
+		stateJSON, conversationID, userID)
+	if err != nil {
+		return fmt.Errorf("update mcp state: %w", err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func decodeMCPState(raw []byte) (*MCPState, error) {
+	state := &MCPState{
+		Mode:           "inactive",
+		ActivatedTools: []string{},
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, state); err != nil {
+			return nil, fmt.Errorf("decode mcp_state: %w", err)
+		}
+	}
+	return normalizeMCPState(state), nil
+}
+
+func normalizeMCPState(state *MCPState) *MCPState {
+	if state == nil {
+		state = &MCPState{}
+	}
+	if state.Mode == "" {
+		state.Mode = "inactive"
+	}
+	if state.Mode != "active" {
+		state.Mode = "inactive"
+		state.ActivatedTools = []string{}
+		state.SourceMessageID = nil
+	}
+	if state.ActivatedTools == nil {
+		state.ActivatedTools = []string{}
+	}
+	return state
 }

@@ -16,8 +16,8 @@ import (
 )
 
 type Client struct {
-	httpClient      *http.Client
-	refreshTokenFn  TokenRefreshFunc
+	httpClient     *http.Client
+	refreshTokenFn TokenRefreshFunc
 }
 
 func NewClient() *Client {
@@ -27,12 +27,14 @@ func NewClient() *Client {
 }
 
 type ServerConfig struct {
-	ChannelID      uuid.UUID
-	ServerURL      string
-	Token          string
-	RefreshToken   string
-	Provider       string
-	TokenExpiresAt string
+	ChannelID         uuid.UUID
+	ServerURL         string
+	Token             string
+	RefreshToken      string
+	Provider          string
+	TokenExpiresAt    string
+	OAuthClientID     string
+	OAuthClientSecret string
 }
 
 type TokenRefreshFunc func(ctx context.Context, cfg ServerConfig) (ServerConfig, error)
@@ -42,8 +44,8 @@ func (c *Client) SetTokenRefreshFunc(fn TokenRefreshFunc) {
 }
 
 type resolvedAuth struct {
-	token      string
-	isFeishu   bool
+	token    string
+	isFeishu bool
 }
 
 type ToolDefinition struct {

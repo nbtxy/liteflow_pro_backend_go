@@ -72,6 +72,7 @@ func (t *ActiveMCPTool) Execute(ctx context.Context, input map[string]any, tc *T
 		Metadata: map[string]any{
 			"mcp_mode":        "active",
 			"activated_tools": activated,
+			"source_message_id": tc.MessageID.String(),
 			"platform":        platform,
 		},
 	}, nil

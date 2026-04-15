@@ -134,14 +134,18 @@ func (s *Service) GetServerConfigForChannel(ctx context.Context, channelID uuid.
 	}
 	provider, _ := cfg["provider"].(string)
 	expiresAt, _ := cfg["expiresAt"].(string)
+	oauthClientID, _ := cfg["oauthClientId"].(string)
+	oauthClientSecret, _ := cfg["oauthClientSecret"].(string)
 
 	return ServerConfig{
-		ChannelID:      channelID,
-		ServerURL:      serverURL,
-		Token:          token,
-		RefreshToken:   refreshToken,
-		Provider:       provider,
-		TokenExpiresAt: expiresAt,
+		ChannelID:         channelID,
+		ServerURL:         serverURL,
+		Token:             token,
+		RefreshToken:      refreshToken,
+		Provider:          provider,
+		TokenExpiresAt:    expiresAt,
+		OAuthClientID:     oauthClientID,
+		OAuthClientSecret: oauthClientSecret,
 	}, nil
 }
 
@@ -156,7 +160,7 @@ func (s *Service) RefreshChannelToken(ctx context.Context, cfg ServerConfig, oau
 		return ServerConfig{}, fmt.Errorf("缺少 refresh_token，无法刷新 token")
 	}
 
-	tokenSet, err := oauthSvc.RefreshAccessToken(ctx, cfg.Provider, cfg.RefreshToken)
+	tokenSet, err := oauthSvc.RefreshAccessToken(ctx, cfg.Provider, cfg.RefreshToken, cfg.OAuthClientID, cfg.OAuthClientSecret)
 	if err != nil {
 		return ServerConfig{}, err
 	}
@@ -186,6 +190,12 @@ func (s *Service) RefreshChannelToken(ctx context.Context, cfg ServerConfig, oau
 
 	channelCfg["token"] = updated.Token
 	channelCfg["provider"] = updated.Provider
+	if updated.OAuthClientID != "" {
+		channelCfg["oauthClientId"] = updated.OAuthClientID
+	}
+	if updated.OAuthClientSecret != "" {
+		channelCfg["oauthClientSecret"] = updated.OAuthClientSecret
+	}
 	if updated.RefreshToken != "" {
 		channelCfg["refreshToken"] = updated.RefreshToken
 	}

@@ -124,6 +124,13 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		return
 	}
 
+	mcpState := &conversation.MCPState{Mode: "inactive", ActivatedTools: []string{}}
+	if state, stateErr := s.convSvc.GetMCPState(ctx, conv.ID, userID); stateErr != nil {
+		slog.Warn("failed to load conversation MCP state", "conversationId", conv.ID, "err", stateErr)
+	} else {
+		mcpState = state
+	}
+
 	llmReq := s.contextAsm.Assemble(history, conv.ID.String(), "", "")
 
 	assistantMsgID := uuid.New()
@@ -155,6 +162,11 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	var purpose string
 	if hasTools {
 		purpose = "chat_with_tools"
+		currentMcpState := &conversation.MCPState{
+			Mode:            mcpState.Mode,
+			ActivatedTools:  append([]string(nil), mcpState.ActivatedTools...),
+			SourceMessageID: mcpState.SourceMessageID,
+		}
 		toolCtx := &tool.ToolContext{
 			ConversationID: conv.ID,
 			MessageID:      assistantMsgID,
@@ -163,7 +175,10 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 		var textAccum strings.Builder // accumulate text between tool calls
 
-		agentEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc)
+		agentEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
+			MCPMode:        currentMcpState.Mode,
+			ActivatedTools: currentMcpState.ActivatedTools,
+		})
 		for ev := range agentEvents {
 			switch ev.Type {
 			case agent.EventTextDelta:
@@ -197,6 +212,15 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 				toolUseID, _ := ev.Data["toolUseId"].(string)
 				status, _ := ev.Data["status"].(string)
 				content, _ := ev.Data["content"].(string)
+				if mode, ok := ev.Data["mcp_mode"].(string); ok {
+					currentMcpState.Mode = mode
+					currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
+					if sourceMessageID := parseStringPointer(ev.Data["source_message_id"]); sourceMessageID != nil {
+						currentMcpState.SourceMessageID = sourceMessageID
+					} else if mode != "active" {
+						currentMcpState.SourceMessageID = nil
+					}
+				}
 				if tc, ok := toolUseIndex[toolUseID]; ok {
 					tc["status"] = status
 					if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
@@ -216,6 +240,9 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		// Flush remaining text
 		if textAccum.Len() > 0 {
 			contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+		}
+		if err := s.convSvc.SetMCPState(ctx, conv.ID, userID, currentMcpState); err != nil {
+			slog.Warn("failed to persist conversation MCP state", "conversationId", conv.ID, "err", err)
 		}
 	} else {
 		purpose = "chat"
@@ -325,6 +352,31 @@ func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage 
 	slog.Info("generated title", "conversationId", conv.ID, "title", title)
 }
 
+func parseStringSlice(v any) []string {
+	if names, ok := v.([]string); ok {
+		return names
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return []string{}
+	}
+	result := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok && s != "" {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func parseStringPointer(v any) *string {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return nil
+	}
+	return &s
+}
+
 func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID) <-chan agent.Event {
 	events := make(chan agent.Event, 64)
 
@@ -366,6 +418,31 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			return
 		}
 
+		mcpState := &conversation.MCPState{Mode: "inactive", ActivatedTools: []string{}}
+		var prevMcpState *conversation.MCPState
+		if state, prevState, stateErr := s.convSvc.GetMCPStateWithPrev(ctx, convID, userID); stateErr != nil {
+			slog.Warn("failed to load conversation MCP state for regenerate", "conversationId", convID, "err", stateErr)
+		} else {
+			mcpState = state
+			prevMcpState = prevState
+		}
+		if mcpState.SourceMessageID != nil && *mcpState.SourceMessageID == msgID.String() {
+			if prevMcpState != nil {
+				mcpState = &conversation.MCPState{
+					Mode:            prevMcpState.Mode,
+					ActivatedTools:  append([]string(nil), prevMcpState.ActivatedTools...),
+					SourceMessageID: prevMcpState.SourceMessageID,
+				}
+			} else {
+				mcpState.Mode = "inactive"
+				mcpState.ActivatedTools = []string{}
+				mcpState.SourceMessageID = nil
+			}
+			if err := s.convSvc.SetMCPState(ctx, convID, userID, mcpState); err != nil {
+				slog.Warn("failed to reset conversation MCP state for regenerate", "conversationId", convID, "messageId", msgID, "err", err)
+			}
+		}
+
 		llmReq := s.contextAsm.Assemble(history, conversationID, "", "")
 
 		newMsgID := uuid.New()
@@ -397,6 +474,11 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 		if hasTools {
 			purpose = "chat_with_tools"
+			currentMcpState := &conversation.MCPState{
+				Mode:            mcpState.Mode,
+				ActivatedTools:  append([]string(nil), mcpState.ActivatedTools...),
+				SourceMessageID: mcpState.SourceMessageID,
+			}
 			toolCtx := &tool.ToolContext{
 				ConversationID: convID,
 				MessageID:      newMsgID,
@@ -404,7 +486,10 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 
 			var textAccum strings.Builder
-			for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc) {
+			for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
+				MCPMode:        currentMcpState.Mode,
+				ActivatedTools: currentMcpState.ActivatedTools,
+			}) {
 				switch ev.Type {
 				case agent.EventTextDelta:
 					if c, ok := ev.Data["content"].(string); ok {
@@ -436,6 +521,15 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 					toolUseID, _ := ev.Data["toolUseId"].(string)
 					status, _ := ev.Data["status"].(string)
 					content, _ := ev.Data["content"].(string)
+					if mode, ok := ev.Data["mcp_mode"].(string); ok {
+						currentMcpState.Mode = mode
+						currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
+						if sourceMessageID := parseStringPointer(ev.Data["source_message_id"]); sourceMessageID != nil {
+							currentMcpState.SourceMessageID = sourceMessageID
+						} else if mode != "active" {
+							currentMcpState.SourceMessageID = nil
+						}
+					}
 					if tc, ok := toolUseIndex[toolUseID]; ok {
 						tc["status"] = status
 						if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
@@ -454,6 +548,9 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 			if textAccum.Len() > 0 {
 				contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+			}
+			if err := s.convSvc.SetMCPState(ctx, convID, userID, currentMcpState); err != nil {
+				slog.Warn("failed to persist conversation MCP state for regenerate", "conversationId", convID, "err", err)
 			}
 		} else {
 			provider := s.providerRouter.Default()
