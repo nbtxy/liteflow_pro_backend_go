@@ -45,10 +45,11 @@ func ToolUseInputEvent(toolUseID string, input map[string]any) Event {
 	})
 }
 
-func ToolResultEvent(toolUseID, status string) Event {
+func ToolResultEvent(toolUseID, status, content string) Event {
 	return NewEvent(EventToolResult, map[string]any{
 		"toolUseId": toolUseID,
 		"status":    status,
+		"content":   content,
 	})
 }
 

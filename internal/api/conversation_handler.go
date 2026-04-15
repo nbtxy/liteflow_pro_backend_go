@@ -288,7 +288,7 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	OKEmpty(w)
 }
 
-// messageResponse is the API response DTO that extracts toolCalls and attachments
+// messageResponse is the API response DTO that extracts metadata fields
 // from metadata to top-level fields, matching the frontend Message interface.
 type messageResponse struct {
 	ID             uuid.UUID       `json:"id"`
@@ -297,7 +297,6 @@ type messageResponse struct {
 	Content        string          `json:"content"`
 	TokenCount     *int32          `json:"tokenCount,omitempty"`
 	CreatedAt      string          `json:"createdAt"`
-	ToolCalls      json.RawMessage `json:"toolCalls,omitempty"`
 	ContentParts   json.RawMessage `json:"contentParts,omitempty"`
 	Attachments    json.RawMessage `json:"attachments,omitempty"`
 	QuotedMessage  json.RawMessage `json:"quotedMessage,omitempty"`
@@ -318,9 +317,6 @@ func flattenMessages(msgs []domain.Message) []messageResponse {
 		if len(m.Metadata) > 0 {
 			var meta map[string]json.RawMessage
 			if json.Unmarshal(m.Metadata, &meta) == nil {
-				if tc, ok := meta["toolCalls"]; ok {
-					resp.ToolCalls = tc
-				}
 				if cp, ok := meta["contentParts"]; ok {
 					resp.ContentParts = cp
 				}

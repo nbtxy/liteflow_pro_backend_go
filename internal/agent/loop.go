@@ -307,6 +307,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	if result.IsError {
 		status = "error"
 	}
+	resultContent := truncateToolResult(result.Content)
 
 	slog.Info("tool executed",
 		"toolName", tc.name,
@@ -314,7 +315,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		"durationMs", durationMs,
 	)
 
-	events = append(events, ToolResultEvent(tc.id, status))
+	events = append(events, ToolResultEvent(tc.id, status, resultContent))
 
 	if result.Metadata != nil {
 		if artifactEvents := buildArtifactEvents(result.Metadata, tc.name, input); len(artifactEvents) > 0 {
@@ -324,7 +325,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 
 	toolResultMsg := llm.LlmMessage{
 		Role:       "tool",
-		Content:    truncateToolResult(result.Content),
+		Content:    resultContent,
 		ToolCallID: tc.id,
 		Name:       tc.name,
 	}

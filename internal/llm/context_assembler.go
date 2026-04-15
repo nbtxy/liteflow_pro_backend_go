@@ -165,28 +165,19 @@ func buildLlmMessages(
 	}
 
 	if msg.Role == "assistant" && msg.Metadata != nil {
-		// New format: tool_messages contains the full intermediate tool chain
-		var toolMeta struct {
-			ToolMessages []LlmMessage `json:"tool_messages"`
+		var assistantMeta struct {
+			ContentParts []assistantContentPart `json:"contentParts"`
 		}
-		if err := json.Unmarshal(msg.Metadata, &toolMeta); err == nil && len(toolMeta.ToolMessages) > 0 {
-			// Expand: intermediate tool messages first, then the final assistant response
-			result := make([]LlmMessage, 0, len(toolMeta.ToolMessages)+1)
-			result = append(result, toolMeta.ToolMessages...)
-			result = append(result, LlmMessage{Role: "assistant", Content: msg.Content})
-			return result
-		}
-
-		// Legacy format: tool_calls on the assistant message itself
-		var meta struct {
-			ToolCalls []ToolCall `json:"tool_calls"`
-		}
-		if err := json.Unmarshal(msg.Metadata, &meta); err == nil && len(meta.ToolCalls) > 0 {
-			return []LlmMessage{{
-				Role:      "assistant",
-				Content:   msg.Content,
-				ToolCalls: meta.ToolCalls,
-			}}
+		if err := json.Unmarshal(msg.Metadata, &assistantMeta); err == nil {
+			if len(assistantMeta.ContentParts) > 0 {
+				intermediate := buildIntermediateMessagesFromContentParts(assistantMeta.ContentParts)
+				if len(intermediate) > 0 {
+					result := make([]LlmMessage, 0, len(intermediate)+1)
+					result = append(result, intermediate...)
+					result = append(result, LlmMessage{Role: "assistant", Content: msg.Content})
+					return result
+				}
+			}
 		}
 	}
 
@@ -268,6 +259,79 @@ func buildLlmMessages(
 	}
 
 	return []LlmMessage{{Role: msg.Role, Content: msg.Content}}
+}
+
+type assistantContentPart struct {
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	ToolUseID string `json:"toolUseId,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Status    string `json:"status,omitempty"`
+	ToolCall  *struct {
+		ToolUseID string `json:"toolUseId"`
+		ToolName  string `json:"toolName"`
+		Input     any    `json:"input,omitempty"`
+	} `json:"toolCall,omitempty"`
+}
+
+func buildIntermediateMessagesFromContentParts(parts []assistantContentPart) []LlmMessage {
+	result := make([]LlmMessage, 0, len(parts))
+	toolNameByID := make(map[string]string, 8)
+	var pendingText strings.Builder
+
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			pendingText.WriteString(part.Text)
+		case "tool_use":
+			if part.ToolCall == nil || part.ToolCall.ToolUseID == "" {
+				continue
+			}
+
+			arguments := "{}"
+			if part.ToolCall.Input != nil {
+				if b, err := json.Marshal(part.ToolCall.Input); err == nil && len(b) > 0 {
+					arguments = string(b)
+				}
+			}
+			if !isValidToolArgumentsJSON(arguments) {
+				arguments = "{}"
+			}
+
+			toolUseID := part.ToolCall.ToolUseID
+			toolName := part.ToolCall.ToolName
+			if toolName != "" {
+				toolNameByID[toolUseID] = toolName
+			}
+
+			result = append(result, LlmMessage{
+				Role:    "assistant",
+				Content: pendingText.String(),
+				ToolCalls: []ToolCall{{
+					ID:   toolUseID,
+					Type: "function",
+					Function: ToolCallFunc{
+						Name:      toolName,
+						Arguments: arguments,
+					},
+				}},
+			})
+			pendingText.Reset()
+		case "tool_result":
+			toolUseID := part.ToolUseID
+			if toolUseID == "" {
+				continue
+			}
+			result = append(result, LlmMessage{
+				Role:       "tool",
+				Content:    part.Content,
+				ToolCallID: toolUseID,
+				Name:       toolNameByID[toolUseID],
+			})
+		}
+	}
+
+	return result
 }
 
 func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {

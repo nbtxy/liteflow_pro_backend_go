@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -149,15 +148,11 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	})
 
 	var fullContent strings.Builder
-	var collectedToolCalls []map[string]any
 	var contentParts []map[string]any
-	var toolMessages []llm.LlmMessage
-	var tcMu sync.Mutex
+	toolUseIndex := make(map[string]map[string]any)
 
 	hasTools := len(s.toolRegistry.All()) > 0
 	var purpose string
-	initialMsgCount := len(llmReq.Messages)
-
 	if hasTools {
 		purpose = "chat_with_tools"
 		toolCtx := &tool.ToolContext{
@@ -177,57 +172,50 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 					textAccum.WriteString(content)
 				}
 			case agent.EventToolUseStart:
-				tcMu.Lock()
 				// Flush accumulated text as a text part
 				if textAccum.Len() > 0 {
 					contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
 					textAccum.Reset()
 				}
+				startedAt := time.Now().UnixMilli()
 				tc := map[string]any{
 					"toolUseId": ev.Data["toolUseId"],
 					"toolName":  ev.Data["toolName"],
 					"status":    "running",
+					"startedAt": startedAt,
 				}
-				collectedToolCalls = append(collectedToolCalls, tc)
+				if toolUseID, _ := ev.Data["toolUseId"].(string); toolUseID != "" {
+					toolUseIndex[toolUseID] = tc
+				}
 				contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
-				tcMu.Unlock()
 			case agent.EventToolUseInput:
-				tcMu.Lock()
 				toolUseID, _ := ev.Data["toolUseId"].(string)
-				for _, tc := range collectedToolCalls {
-					if tc["toolUseId"] == toolUseID {
-						tc["input"] = ev.Data["input"]
-					}
+				if tc, ok := toolUseIndex[toolUseID]; ok {
+					tc["input"] = ev.Data["input"]
 				}
-				tcMu.Unlock()
 			case agent.EventToolResult:
-				tcMu.Lock()
 				toolUseID, _ := ev.Data["toolUseId"].(string)
-				for _, tc := range collectedToolCalls {
-					if tc["toolUseId"] == toolUseID {
-						tc["status"] = ev.Data["status"]
+				status, _ := ev.Data["status"].(string)
+				content, _ := ev.Data["content"].(string)
+				if tc, ok := toolUseIndex[toolUseID]; ok {
+					tc["status"] = status
+					if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
+						tc["duration"] = time.Now().UnixMilli() - startedAt
 					}
 				}
-				tcMu.Unlock()
+				contentParts = append(contentParts, map[string]any{
+					"type":      "tool_result",
+					"toolUseId": toolUseID,
+					"status":    status,
+					"content":   content,
+				})
 			}
 			events <- ev
 		}
 
 		// Flush remaining text
-		tcMu.Lock()
 		if textAccum.Len() > 0 {
 			contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-		}
-		tcMu.Unlock()
-
-		// Collect intermediate tool messages for context assembler
-		// (stored in final message metadata, not as separate DB rows)
-		if len(llmReq.Messages) > initialMsgCount {
-			for _, m := range llmReq.Messages[initialMsgCount:] {
-				if (m.Role == "assistant" && len(m.ToolCalls) > 0) || m.Role == "tool" {
-					toolMessages = append(toolMessages, m)
-				}
-			}
 		}
 	} else {
 		purpose = "chat"
@@ -256,14 +244,8 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 	var metadata json.RawMessage
 	metaMap := map[string]any{}
-	if len(collectedToolCalls) > 0 {
-		metaMap["toolCalls"] = collectedToolCalls
-	}
 	if len(contentParts) > 0 {
 		metaMap["contentParts"] = contentParts
-	}
-	if len(toolMessages) > 0 {
-		metaMap["tool_messages"] = toolMessages
 	}
 	if len(metaMap) > 0 {
 		if metaBytes, err := json.Marshal(metaMap); err == nil {
@@ -408,13 +390,10 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		})
 
 		var fullContent strings.Builder
-		var collectedToolCalls []map[string]any
 		var contentParts []map[string]any
-		var toolMessages []llm.LlmMessage
-		var tcMu sync.Mutex
+		toolUseIndex := make(map[string]map[string]any)
 		hasTools := len(s.toolRegistry.All()) > 0
 		purpose := "chat"
-		regenInitialMsgCount := len(llmReq.Messages)
 
 		if hasTools {
 			purpose = "chat_with_tools"
@@ -433,54 +412,48 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 						textAccum.WriteString(c)
 					}
 				case agent.EventToolUseStart:
-					tcMu.Lock()
 					if textAccum.Len() > 0 {
 						contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
 						textAccum.Reset()
 					}
+					startedAt := time.Now().UnixMilli()
 					tc := map[string]any{
 						"toolUseId": ev.Data["toolUseId"],
 						"toolName":  ev.Data["toolName"],
 						"status":    "running",
+						"startedAt": startedAt,
 					}
-					collectedToolCalls = append(collectedToolCalls, tc)
+					if toolUseID, _ := ev.Data["toolUseId"].(string); toolUseID != "" {
+						toolUseIndex[toolUseID] = tc
+					}
 					contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
-					tcMu.Unlock()
 				case agent.EventToolUseInput:
-					tcMu.Lock()
 					toolUseID, _ := ev.Data["toolUseId"].(string)
-					for _, tc := range collectedToolCalls {
-						if tc["toolUseId"] == toolUseID {
-							tc["input"] = ev.Data["input"]
-						}
+					if tc, ok := toolUseIndex[toolUseID]; ok {
+						tc["input"] = ev.Data["input"]
 					}
-					tcMu.Unlock()
 				case agent.EventToolResult:
-					tcMu.Lock()
 					toolUseID, _ := ev.Data["toolUseId"].(string)
-					for _, tc := range collectedToolCalls {
-						if tc["toolUseId"] == toolUseID {
-							tc["status"] = ev.Data["status"]
+					status, _ := ev.Data["status"].(string)
+					content, _ := ev.Data["content"].(string)
+					if tc, ok := toolUseIndex[toolUseID]; ok {
+						tc["status"] = status
+						if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
+							tc["duration"] = time.Now().UnixMilli() - startedAt
 						}
 					}
-					tcMu.Unlock()
+					contentParts = append(contentParts, map[string]any{
+						"type":      "tool_result",
+						"toolUseId": toolUseID,
+						"status":    status,
+						"content":   content,
+					})
 				}
 				events <- ev
 			}
 
-			tcMu.Lock()
 			if textAccum.Len() > 0 {
 				contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-			}
-			tcMu.Unlock()
-
-			// Collect intermediate tool messages for context assembler
-			if len(llmReq.Messages) > regenInitialMsgCount {
-				for _, m := range llmReq.Messages[regenInitialMsgCount:] {
-					if (m.Role == "assistant" && len(m.ToolCalls) > 0) || m.Role == "tool" {
-						toolMessages = append(toolMessages, m)
-					}
-				}
 			}
 		} else {
 			provider := s.providerRouter.Default()
@@ -510,14 +483,8 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 		// Build metadata
 		metaMap := map[string]any{}
-		if len(collectedToolCalls) > 0 {
-			metaMap["toolCalls"] = collectedToolCalls
-		}
 		if len(contentParts) > 0 {
 			metaMap["contentParts"] = contentParts
-		}
-		if len(toolMessages) > 0 {
-			metaMap["tool_messages"] = toolMessages
 		}
 		if len(metaMap) > 0 {
 			if metaBytes, err := json.Marshal(metaMap); err == nil {
