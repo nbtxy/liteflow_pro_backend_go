@@ -304,8 +304,8 @@ type messageResponse struct {
 }
 
 func flattenMessages(msgs []domain.Message) []messageResponse {
-	result := make([]messageResponse, len(msgs))
-	for i, m := range msgs {
+	result := make([]messageResponse, 0, len(msgs))
+	for _, m := range msgs {
 		resp := messageResponse{
 			ID:             m.ID,
 			ConversationID: m.ConversationID,
@@ -333,7 +333,7 @@ func flattenMessages(msgs []domain.Message) []messageResponse {
 			}
 		}
 
-		result[i] = resp
+		result = append(result, resp)
 	}
 	return result
 }

@@ -107,9 +107,8 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 				}
 			}
 
-			llmHistory = append([]LlmMessage{
-				buildLlmMessage(msg, conversationID, visionSupported, ca.storageSvc, ca.ossLinkSvc),
-			}, llmHistory...)
+			expanded := buildLlmMessages(msg, conversationID, visionSupported, ca.storageSvc, ca.ossLinkSvc)
+			llmHistory = append(expanded, llmHistory...)
 			currentTokens += msgTokens
 		}
 
@@ -146,35 +145,48 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 	return req
 }
 
-func buildLlmMessage(
+func buildLlmMessages(
 	msg domain.Message,
 	conversationID string,
 	visionSupported bool,
 	storageSvc storage.Service,
 	ossLinkSvc storage.Service,
-) LlmMessage {
+) []LlmMessage {
 	if msg.Role == "tool" && msg.Metadata != nil {
 		var meta domain.MessageMetadata
 		if err := json.Unmarshal(msg.Metadata, &meta); err == nil {
-			return LlmMessage{
+			return []LlmMessage{{
 				Role:       "tool",
 				Content:    msg.Content,
 				ToolCallID: meta.ToolCallID,
 				Name:       meta.ToolName,
-			}
+			}}
 		}
 	}
 
 	if msg.Role == "assistant" && msg.Metadata != nil {
+		// New format: tool_messages contains the full intermediate tool chain
+		var toolMeta struct {
+			ToolMessages []LlmMessage `json:"tool_messages"`
+		}
+		if err := json.Unmarshal(msg.Metadata, &toolMeta); err == nil && len(toolMeta.ToolMessages) > 0 {
+			// Expand: intermediate tool messages first, then the final assistant response
+			result := make([]LlmMessage, 0, len(toolMeta.ToolMessages)+1)
+			result = append(result, toolMeta.ToolMessages...)
+			result = append(result, LlmMessage{Role: "assistant", Content: msg.Content})
+			return result
+		}
+
+		// Legacy format: tool_calls on the assistant message itself
 		var meta struct {
 			ToolCalls []ToolCall `json:"tool_calls"`
 		}
 		if err := json.Unmarshal(msg.Metadata, &meta); err == nil && len(meta.ToolCalls) > 0 {
-			return LlmMessage{
+			return []LlmMessage{{
 				Role:      "assistant",
 				Content:   msg.Content,
 				ToolCalls: meta.ToolCalls,
-			}
+			}}
 		}
 	}
 
@@ -245,17 +257,17 @@ func buildLlmMessage(
 				}
 
 				if len(images) > 0 || combinedContent != msg.Content {
-					return LlmMessage{Role: "user", Content: combinedContent, Images: images}
+					return []LlmMessage{{Role: "user", Content: combinedContent, Images: images}}
 				}
 			}
 
 			if content != msg.Content {
-				return LlmMessage{Role: "user", Content: content}
+				return []LlmMessage{{Role: "user", Content: content}}
 			}
 		}
 	}
 
-	return LlmMessage{Role: msg.Role, Content: msg.Content}
+	return []LlmMessage{{Role: msg.Role, Content: msg.Content}}
 }
 
 func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {

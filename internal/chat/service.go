@@ -151,6 +151,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	var fullContent strings.Builder
 	var collectedToolCalls []map[string]any
 	var contentParts []map[string]any
+	var toolMessages []llm.LlmMessage
 	var tcMu sync.Mutex
 
 	hasTools := len(s.toolRegistry.All()) > 0
@@ -219,9 +220,15 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		}
 		tcMu.Unlock()
 
-		// Persist intermediate tool messages (assistant with tool_calls + tool results)
-		// so that context assembler can reconstruct the full tool call chain on next turn.
-		s.saveIntermediateToolMessages(ctx, conv.ID, assistantMsgID, llmReq.Messages[initialMsgCount:])
+		// Collect intermediate tool messages for context assembler
+		// (stored in final message metadata, not as separate DB rows)
+		if len(llmReq.Messages) > initialMsgCount {
+			for _, m := range llmReq.Messages[initialMsgCount:] {
+				if (m.Role == "assistant" && len(m.ToolCalls) > 0) || m.Role == "tool" {
+					toolMessages = append(toolMessages, m)
+				}
+			}
+		}
 	} else {
 		purpose = "chat"
 		provider := s.providerRouter.Default()
@@ -254,6 +261,9 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	}
 	if len(contentParts) > 0 {
 		metaMap["contentParts"] = contentParts
+	}
+	if len(toolMessages) > 0 {
+		metaMap["tool_messages"] = toolMessages
 	}
 	if len(metaMap) > 0 {
 		if metaBytes, err := json.Marshal(metaMap); err == nil {
@@ -333,84 +343,6 @@ func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage 
 	slog.Info("generated title", "conversationId", conv.ID, "title", title)
 }
 
-// saveIntermediateToolMessages persists assistant tool-call messages and tool result
-// messages generated during multi-turn agent loop, so that the context assembler can
-// reconstruct the full tool call chain on subsequent conversation turns.
-func (s *Service) saveIntermediateToolMessages(ctx context.Context, convID, assistantMsgID uuid.UUID, newMessages []llm.LlmMessage) {
-	if len(newMessages) == 0 {
-		return
-	}
-
-	persistCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	for _, msg := range newMessages {
-		switch msg.Role {
-		case "assistant":
-			if len(msg.ToolCalls) == 0 {
-				continue // skip non-tool assistant messages (final response)
-			}
-			meta := domain.MessageMetadata{
-				ToolCalls: make([]domain.ToolCallInfo, len(msg.ToolCalls)),
-			}
-			for i, tc := range msg.ToolCalls {
-				meta.ToolCalls[i] = domain.ToolCallInfo{
-					ID:   tc.ID,
-					Type: tc.Type,
-					Function: domain.ToolCallFunc{
-						Name:      tc.Function.Name,
-						Arguments: tc.Function.Arguments,
-					},
-				}
-			}
-			metaBytes, err := json.Marshal(meta)
-			if err != nil {
-				slog.Error("failed to marshal tool call metadata", "err", err)
-				continue
-			}
-			domMsg := &domain.Message{
-				ID:             uuid.New(),
-				ConversationID: convID,
-				Role:           "assistant",
-				Content:        msg.Content,
-				Metadata:       metaBytes,
-				CreatedAt:      time.Now(),
-			}
-			if err := s.convSvc.SaveMessage(persistCtx, domMsg); err != nil {
-				slog.Error("failed to save intermediate assistant message", "err", err)
-			}
-
-		case "tool":
-			meta := domain.MessageMetadata{
-				ToolCallID: msg.ToolCallID,
-				ToolName:   msg.Name,
-			}
-			metaBytes, err := json.Marshal(meta)
-			if err != nil {
-				slog.Error("failed to marshal tool result metadata", "err", err)
-				continue
-			}
-			domMsg := &domain.Message{
-				ID:             uuid.New(),
-				ConversationID: convID,
-				Role:           "tool",
-				Content:        msg.Content,
-				Metadata:       metaBytes,
-				CreatedAt:      time.Now(),
-			}
-			if err := s.convSvc.SaveMessage(persistCtx, domMsg); err != nil {
-				slog.Error("failed to save tool result message", "err", err)
-			}
-		}
-	}
-
-	slog.Info("saved intermediate tool messages",
-		"conversationId", convID,
-		"assistantMsgId", assistantMsgID,
-		"newMessageCount", len(newMessages),
-	)
-}
-
 func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID) <-chan agent.Event {
 	events := make(chan agent.Event, 64)
 
@@ -476,6 +408,10 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		})
 
 		var fullContent strings.Builder
+		var collectedToolCalls []map[string]any
+		var contentParts []map[string]any
+		var toolMessages []llm.LlmMessage
+		var tcMu sync.Mutex
 		hasTools := len(s.toolRegistry.All()) > 0
 		purpose := "chat"
 		regenInitialMsgCount := len(llmReq.Messages)
@@ -487,15 +423,65 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 				MessageID:      newMsgID,
 				UserID:         userID,
 			}
+
+			var textAccum strings.Builder
 			for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc) {
-				if ev.Type == agent.EventTextDelta {
+				switch ev.Type {
+				case agent.EventTextDelta:
 					if c, ok := ev.Data["content"].(string); ok {
 						fullContent.WriteString(c)
+						textAccum.WriteString(c)
 					}
+				case agent.EventToolUseStart:
+					tcMu.Lock()
+					if textAccum.Len() > 0 {
+						contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+						textAccum.Reset()
+					}
+					tc := map[string]any{
+						"toolUseId": ev.Data["toolUseId"],
+						"toolName":  ev.Data["toolName"],
+						"status":    "running",
+					}
+					collectedToolCalls = append(collectedToolCalls, tc)
+					contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
+					tcMu.Unlock()
+				case agent.EventToolUseInput:
+					tcMu.Lock()
+					toolUseID, _ := ev.Data["toolUseId"].(string)
+					for _, tc := range collectedToolCalls {
+						if tc["toolUseId"] == toolUseID {
+							tc["input"] = ev.Data["input"]
+						}
+					}
+					tcMu.Unlock()
+				case agent.EventToolResult:
+					tcMu.Lock()
+					toolUseID, _ := ev.Data["toolUseId"].(string)
+					for _, tc := range collectedToolCalls {
+						if tc["toolUseId"] == toolUseID {
+							tc["status"] = ev.Data["status"]
+						}
+					}
+					tcMu.Unlock()
 				}
 				events <- ev
 			}
-			s.saveIntermediateToolMessages(ctx, convID, newMsgID, llmReq.Messages[regenInitialMsgCount:])
+
+			tcMu.Lock()
+			if textAccum.Len() > 0 {
+				contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+			}
+			tcMu.Unlock()
+
+			// Collect intermediate tool messages for context assembler
+			if len(llmReq.Messages) > regenInitialMsgCount {
+				for _, m := range llmReq.Messages[regenInitialMsgCount:] {
+					if (m.Role == "assistant" && len(m.ToolCalls) > 0) || m.Role == "tool" {
+						toolMessages = append(toolMessages, m)
+					}
+				}
+			}
 		} else {
 			provider := s.providerRouter.Default()
 			if provider == nil {
@@ -521,6 +507,23 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		assistantMsg.Content = fullContent.String()
 		tc := int32(len(assistantMsg.Content))
 		assistantMsg.TokenCount = &tc
+
+		// Build metadata
+		metaMap := map[string]any{}
+		if len(collectedToolCalls) > 0 {
+			metaMap["toolCalls"] = collectedToolCalls
+		}
+		if len(contentParts) > 0 {
+			metaMap["contentParts"] = contentParts
+		}
+		if len(toolMessages) > 0 {
+			metaMap["tool_messages"] = toolMessages
+		}
+		if len(metaMap) > 0 {
+			if metaBytes, err := json.Marshal(metaMap); err == nil {
+				assistantMsg.Metadata = metaBytes
+			}
+		}
 
 		persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer persistCancel()
