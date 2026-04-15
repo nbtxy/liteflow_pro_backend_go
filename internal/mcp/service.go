@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -127,5 +128,82 @@ func (s *Service) GetServerConfigForChannel(ctx context.Context, channelID uuid.
 
 	serverURL, _ := cfg["serverUrl"].(string)
 	token, _ := cfg["token"].(string)
-	return ServerConfig{ServerURL: serverURL, Token: token}, nil
+	refreshToken, _ := cfg["refreshToken"].(string)
+	if refreshToken == "" {
+		refreshToken, _ = cfg["refresh_token"].(string)
+	}
+	provider, _ := cfg["provider"].(string)
+	expiresAt, _ := cfg["expiresAt"].(string)
+
+	return ServerConfig{
+		ChannelID:      channelID,
+		ServerURL:      serverURL,
+		Token:          token,
+		RefreshToken:   refreshToken,
+		Provider:       provider,
+		TokenExpiresAt: expiresAt,
+	}, nil
+}
+
+func (s *Service) RefreshChannelToken(ctx context.Context, cfg ServerConfig, oauthSvc *OAuthService) (ServerConfig, error) {
+	if oauthSvc == nil {
+		return ServerConfig{}, fmt.Errorf("oauth service not available")
+	}
+	if cfg.Provider == "" {
+		return ServerConfig{}, fmt.Errorf("缺少 provider，无法刷新 token")
+	}
+	if cfg.RefreshToken == "" {
+		return ServerConfig{}, fmt.Errorf("缺少 refresh_token，无法刷新 token")
+	}
+
+	tokenSet, err := oauthSvc.RefreshAccessToken(ctx, cfg.Provider, cfg.RefreshToken)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+
+	updated := cfg
+	updated.Token = tokenSet.AccessToken
+	if tokenSet.RefreshToken != "" {
+		updated.RefreshToken = tokenSet.RefreshToken
+	}
+	if tokenSet.ExpiresIn > 0 {
+		updated.TokenExpiresAt = time.Now().Add(time.Duration(tokenSet.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+	}
+
+	if cfg.ChannelID == uuid.Nil {
+		return updated, nil
+	}
+
+	var configJSON []byte
+	if err := s.pool.QueryRow(ctx, `SELECT config FROM user_channels WHERE id = $1`, cfg.ChannelID).Scan(&configJSON); err != nil {
+		return ServerConfig{}, fmt.Errorf("load channel config: %w", err)
+	}
+
+	var channelCfg map[string]any
+	if err := json.Unmarshal(configJSON, &channelCfg); err != nil {
+		return ServerConfig{}, fmt.Errorf("parse channel config: %w", err)
+	}
+
+	channelCfg["token"] = updated.Token
+	channelCfg["provider"] = updated.Provider
+	if updated.RefreshToken != "" {
+		channelCfg["refreshToken"] = updated.RefreshToken
+	}
+	if updated.TokenExpiresAt != "" {
+		channelCfg["expiresAt"] = updated.TokenExpiresAt
+	}
+
+	newConfigJSON, err := json.Marshal(channelCfg)
+	if err != nil {
+		return ServerConfig{}, fmt.Errorf("marshal channel config: %w", err)
+	}
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE user_channels SET config = $1, updated_at = $2 WHERE id = $3`,
+		newConfigJSON, time.Now(), cfg.ChannelID); err != nil {
+		return ServerConfig{}, fmt.Errorf("persist refreshed token: %w", err)
+	}
+
+	slog.Info("MCP token refreshed", "channelId", cfg.ChannelID, "provider", cfg.Provider)
+	return updated, nil
 }

@@ -323,7 +323,7 @@ func (h *ChannelHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.oauthSvc.ExchangeCodeWithState(r.Context(), body.Provider, body.Code, body.State)
+	tokenSet, err := h.oauthSvc.ExchangeCodeWithState(r.Context(), body.Provider, body.Code, body.State)
 	if err != nil {
 		InternalError(w, "OAuth token exchange failed: "+err.Error())
 		return
@@ -339,8 +339,14 @@ func (h *ChannelHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	config := map[string]any{
 		"serverUrl": body.ServerURL,
-		"token":     token,
+		"token":     tokenSet.AccessToken,
 		"provider":  body.Provider,
+	}
+	if tokenSet.RefreshToken != "" {
+		config["refreshToken"] = tokenSet.RefreshToken
+	}
+	if tokenSet.ExpiresIn > 0 {
+		config["expiresAt"] = time.Now().Add(time.Duration(tokenSet.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
 	}
 
 	ch, err := h.channelMgr.AddChannel(r.Context(), userID, "mcp", body.Provider, displayName, config)

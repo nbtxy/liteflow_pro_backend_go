@@ -16,7 +16,8 @@ import (
 )
 
 type Client struct {
-	httpClient *http.Client
+	httpClient      *http.Client
+	refreshTokenFn  TokenRefreshFunc
 }
 
 func NewClient() *Client {
@@ -26,8 +27,18 @@ func NewClient() *Client {
 }
 
 type ServerConfig struct {
-	ServerURL string
-	Token     string
+	ChannelID      uuid.UUID
+	ServerURL      string
+	Token          string
+	RefreshToken   string
+	Provider       string
+	TokenExpiresAt string
+}
+
+type TokenRefreshFunc func(ctx context.Context, cfg ServerConfig) (ServerConfig, error)
+
+func (c *Client) SetTokenRefreshFunc(fn TokenRefreshFunc) {
+	c.refreshTokenFn = fn
 }
 
 type resolvedAuth struct {
@@ -47,12 +58,13 @@ type ToolResult struct {
 }
 
 func (c *Client) ListTools(ctx context.Context, cfg ServerConfig) ([]ToolDefinition, error) {
-	sessionID, err := c.initializeSession(ctx, cfg)
+	currentCfg := cfg
+	sessionID, err := c.initializeSession(ctx, &currentCfg)
 	if err != nil {
 		return nil, fmt.Errorf("MCP initialize failed: %w", err)
 	}
 
-	result, err := c.jsonRpcCall(ctx, cfg, sessionID, "tools/list", map[string]any{})
+	result, err := c.jsonRpcCall(ctx, &currentCfg, sessionID, "tools/list", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("tools/list failed: %w", err)
 	}
@@ -76,12 +88,13 @@ func (c *Client) ListTools(ctx context.Context, cfg ServerConfig) ([]ToolDefinit
 }
 
 func (c *Client) CallTool(ctx context.Context, cfg ServerConfig, toolName string, arguments map[string]any) (*ToolResult, error) {
-	sessionID, err := c.initializeSession(ctx, cfg)
+	currentCfg := cfg
+	sessionID, err := c.initializeSession(ctx, &currentCfg)
 	if err != nil {
 		return nil, fmt.Errorf("MCP initialize failed: %w", err)
 	}
 
-	result, err := c.jsonRpcCall(ctx, cfg, sessionID, "tools/call", map[string]any{
+	result, err := c.jsonRpcCall(ctx, &currentCfg, sessionID, "tools/call", map[string]any{
 		"name":      toolName,
 		"arguments": arguments,
 	})
@@ -187,10 +200,14 @@ func (c *Client) setAuthHeaders(req *http.Request, auth *resolvedAuth) {
 	}
 }
 
-func (c *Client) initializeSession(ctx context.Context, cfg ServerConfig) (string, error) {
+func (c *Client) initializeSession(ctx context.Context, cfg *ServerConfig) (string, error) {
+	return c.initializeSessionAttempt(ctx, cfg, true)
+}
+
+func (c *Client) initializeSessionAttempt(ctx context.Context, cfg *ServerConfig, allowRefresh bool) (string, error) {
 	slog.Info("MCP initialize", "server", cfg.ServerURL)
 
-	auth, err := c.resolveToken(ctx, cfg)
+	auth, err := c.resolveToken(ctx, *cfg)
 	if err != nil {
 		return "", fmt.Errorf("resolve token: %w", err)
 	}
@@ -229,6 +246,16 @@ func (c *Client) initializeSession(ctx context.Context, cfg ServerConfig) (strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized && allowRefresh {
+			updatedCfg, refreshed, refreshErr := c.tryRefreshToken(ctx, *cfg)
+			if refreshErr != nil {
+				return "", fmt.Errorf("认证失败且刷新令牌失败: %w", refreshErr)
+			}
+			if refreshed {
+				*cfg = updatedCfg
+				return c.initializeSessionAttempt(ctx, cfg, false)
+			}
+		}
 		respBody, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("MCP initialize HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -250,14 +277,18 @@ func (c *Client) initializeSession(ctx context.Context, cfg ServerConfig) (strin
 	}
 
 	// Send initialized notification
-	c.sendNotification(ctx, cfg, auth, sessionID, "notifications/initialized", map[string]any{})
+	c.sendNotification(ctx, *cfg, auth, sessionID, "notifications/initialized", map[string]any{})
 
 	slog.Info("MCP session initialized", "server", cfg.ServerURL, "hasSession", sessionID != "")
 	return sessionID, nil
 }
 
-func (c *Client) jsonRpcCall(ctx context.Context, cfg ServerConfig, sessionID, method string, params map[string]any) (map[string]any, error) {
-	auth, err := c.resolveToken(ctx, cfg)
+func (c *Client) jsonRpcCall(ctx context.Context, cfg *ServerConfig, sessionID, method string, params map[string]any) (map[string]any, error) {
+	return c.jsonRpcCallAttempt(ctx, cfg, sessionID, method, params, true)
+}
+
+func (c *Client) jsonRpcCallAttempt(ctx context.Context, cfg *ServerConfig, sessionID, method string, params map[string]any, allowRefresh bool) (map[string]any, error) {
+	auth, err := c.resolveToken(ctx, *cfg)
 	if err != nil {
 		return nil, fmt.Errorf("resolve token: %w", err)
 	}
@@ -297,6 +328,16 @@ func (c *Client) jsonRpcCall(ctx context.Context, cfg ServerConfig, sessionID, m
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized {
+			if allowRefresh {
+				updatedCfg, refreshed, refreshErr := c.tryRefreshToken(ctx, *cfg)
+				if refreshErr != nil {
+					return nil, fmt.Errorf("认证失败且刷新令牌失败: %w", refreshErr)
+				}
+				if refreshed {
+					*cfg = updatedCfg
+					return c.jsonRpcCallAttempt(ctx, cfg, sessionID, method, params, false)
+				}
+			}
 			return nil, fmt.Errorf("认证失败，请检查令牌是否有效")
 		}
 		return nil, fmt.Errorf("MCP HTTP %d: %s", resp.StatusCode, string(respBody))
@@ -313,6 +354,21 @@ func (c *Client) jsonRpcCall(ctx context.Context, cfg ServerConfig, sessionID, m
 	}
 
 	return parseJsonRpcResult(jsonResp)
+}
+
+func (c *Client) tryRefreshToken(ctx context.Context, cfg ServerConfig) (ServerConfig, bool, error) {
+	if c.refreshTokenFn == nil {
+		return cfg, false, nil
+	}
+	if cfg.Provider == "" || cfg.RefreshToken == "" {
+		return cfg, false, nil
+	}
+	updatedCfg, err := c.refreshTokenFn(ctx, cfg)
+	if err != nil {
+		return cfg, false, err
+	}
+	slog.Info("MCP token refreshed for retry", "channelId", cfg.ChannelID, "provider", cfg.Provider)
+	return updatedCfg, true, nil
 }
 
 func (c *Client) sendNotification(ctx context.Context, cfg ServerConfig, auth *resolvedAuth, sessionID, method string, params map[string]any) {

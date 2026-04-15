@@ -460,12 +460,25 @@ func (m *Manager) GetChannelTools(ctx context.Context, channelID uuid.UUID) ([]m
 func (m *Manager) discoverAndSaveTools(ctx context.Context, channelID, userID uuid.UUID, displayName string, config map[string]any) (int, error) {
 	serverURL, _ := config["serverUrl"].(string)
 	token, _ := config["token"].(string)
+	provider, _ := config["provider"].(string)
+	refreshToken, _ := config["refreshToken"].(string)
+	if refreshToken == "" {
+		refreshToken, _ = config["refresh_token"].(string)
+	}
+	expiresAt, _ := config["expiresAt"].(string)
 
 	if serverURL == "" {
 		return 0, fmt.Errorf("serverUrl is required")
 	}
 
-	cfg := mcp.ServerConfig{ServerURL: serverURL, Token: token}
+	cfg := mcp.ServerConfig{
+		ChannelID:      channelID,
+		ServerURL:      serverURL,
+		Token:          token,
+		RefreshToken:   refreshToken,
+		Provider:       provider,
+		TokenExpiresAt: expiresAt,
+	}
 	tools, err := m.mcpClient.ListTools(ctx, cfg)
 	if err != nil {
 		return 0, fmt.Errorf("无法连接 MCP Server: %w", err)

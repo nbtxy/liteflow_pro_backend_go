@@ -149,6 +149,9 @@ func main() {
 	mcpSvc := mcp.NewService(pool)
 	channelMgr := channel.NewManager(pool, mcpClient)
 	oauthSvc := mcp.NewOAuthService(cfg.MCP)
+	mcpClient.SetTokenRefreshFunc(func(ctx context.Context, serverCfg mcp.ServerConfig) (mcp.ServerConfig, error) {
+		return mcpSvc.RefreshChannelToken(ctx, serverCfg, oauthSvc)
+	})
 	skillRegistry := skill.NewRegistry()
 
 	// Task System (before tool registry so the tool can reference it)

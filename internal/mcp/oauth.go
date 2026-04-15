@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,19 +41,25 @@ func (e *oauthStateEntry) isExpired() bool {
 }
 
 type providerConfig struct {
-	AuthorizeURL    string
-	TokenURL        string
-	ClientID        string
-	ClientSecret    string
-	Scope           string
-	RegisterURL     string // MCP OAuth 2.1 dynamic registration endpoint
-	IsDynamic       bool
+	AuthorizeURL string
+	TokenURL     string
+	ClientID     string
+	ClientSecret string
+	Scope        string
+	RegisterURL  string // MCP OAuth 2.1 dynamic registration endpoint
+	IsDynamic    bool
 }
 
 type dynamicClientInfo struct {
 	ClientID     string
 	ClientSecret string
 	RegisteredAt time.Time
+}
+
+type OAuthTokenSet struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    int64
 }
 
 func NewOAuthService(cfg config.MCPConfig) *OAuthService {
@@ -158,29 +165,29 @@ func (s *OAuthService) GenerateAuthURL(userID uuid.UUID, provider, serverURL str
 	return authURL, state, nil
 }
 
-func (s *OAuthService) ExchangeCode(ctx context.Context, provider, code string) (string, error) {
+func (s *OAuthService) ExchangeCode(ctx context.Context, provider, code string) (OAuthTokenSet, error) {
 	return s.ExchangeCodeWithState(ctx, provider, code, "")
 }
 
-func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code, state string) (string, error) {
+func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code, state string) (OAuthTokenSet, error) {
 	slog.Info("OAuth token exchange", "provider", provider)
 
 	pcfg, ok := s.getProvider(provider)
 	if !ok {
-		return "", fmt.Errorf("不支持该服务的 OAuth 授权")
+		return OAuthTokenSet{}, fmt.Errorf("不支持该服务的 OAuth 授权")
 	}
 
 	if state != "" {
 		val, loaded := s.states.LoadAndDelete(state)
 		if !loaded {
-			return "", fmt.Errorf("授权状态无效或已过期，请重新授权")
+			return OAuthTokenSet{}, fmt.Errorf("授权状态无效或已过期，请重新授权")
 		}
 		entry := val.(*oauthStateEntry)
 		if entry.isExpired() {
-			return "", fmt.Errorf("授权已超时，请重新授权")
+			return OAuthTokenSet{}, fmt.Errorf("授权已超时，请重新授权")
 		}
 		if entry.Provider != provider {
-			return "", fmt.Errorf("授权提供者不匹配")
+			return OAuthTokenSet{}, fmt.Errorf("授权提供者不匹配")
 		}
 	}
 
@@ -215,7 +222,7 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 
 	req, err := http.NewRequestWithContext(ctx, "POST", pcfg.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("build token request: %w", err)
+		return OAuthTokenSet{}, fmt.Errorf("build token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
@@ -227,37 +234,107 @@ func (s *OAuthService) ExchangeCodeWithState(ctx context.Context, provider, code
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("OAuth 令牌交换失败: %w", err)
+		return OAuthTokenSet{}, fmt.Errorf("OAuth 令牌交换失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read token response: %w", err)
+		return OAuthTokenSet{}, fmt.Errorf("read token response: %w", err)
 	}
 
 	slog.Info("OAuth token response", "provider", provider, "status", resp.StatusCode)
 
 	var result map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("解析授权响应失败")
+		return OAuthTokenSet{}, fmt.Errorf("解析授权响应失败")
 	}
 
-	if errField, ok := result["error"].(string); ok && errField != "" {
-		desc, _ := result["error_description"].(string)
-		if desc == "" {
-			desc = errField
+	tokenSet, err := parseTokenSet(result)
+	if err != nil {
+		return OAuthTokenSet{}, err
+	}
+	slog.Info("OAuth token received", "provider", provider, "token_len", len(tokenSet.AccessToken))
+	return tokenSet, nil
+}
+
+func (s *OAuthService) RefreshAccessToken(ctx context.Context, provider, refreshToken string) (OAuthTokenSet, error) {
+	if refreshToken == "" {
+		return OAuthTokenSet{}, fmt.Errorf("refresh_token 为空")
+	}
+	pcfg, ok := s.getProvider(provider)
+	if !ok {
+		return OAuthTokenSet{}, fmt.Errorf("不支持该服务的 OAuth 授权")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+
+	var authHeader string
+	if pcfg.IsDynamic {
+		if dci, ok := s.dynamicClients.Load(provider); ok {
+			dc := dci.(*dynamicClientInfo)
+			form.Set("client_id", dc.ClientID)
+			if dc.ClientSecret != "" {
+				basic := base64.StdEncoding.EncodeToString([]byte(dc.ClientID + ":" + dc.ClientSecret))
+				authHeader = "Basic " + basic
+			}
+		} else {
+			dci, err := s.ensureDynamicClient(provider, pcfg)
+			if err != nil {
+				return OAuthTokenSet{}, fmt.Errorf("动态客户端注册失败: %w", err)
+			}
+			form.Set("client_id", dci.ClientID)
+			if dci.ClientSecret != "" {
+				basic := base64.StdEncoding.EncodeToString([]byte(dci.ClientID + ":" + dci.ClientSecret))
+				authHeader = "Basic " + basic
+			}
 		}
-		return "", fmt.Errorf("OAuth 授权失败: %s", desc)
+	} else if provider == "supabase" {
+		basic := base64.StdEncoding.EncodeToString([]byte(pcfg.ClientID + ":" + pcfg.ClientSecret))
+		authHeader = "Basic " + basic
+	} else {
+		form.Set("client_id", pcfg.ClientID)
+		form.Set("client_secret", pcfg.ClientSecret)
 	}
 
-	accessToken, _ := result["access_token"].(string)
-	if accessToken == "" {
-		return "", fmt.Errorf("未获取到访问令牌")
+	req, err := http.NewRequestWithContext(ctx, "POST", pcfg.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return OAuthTokenSet{}, fmt.Errorf("build refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "LiteFlow-Backend/1.0")
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
 
-	slog.Info("OAuth token received", "provider", provider, "token_len", len(accessToken))
-	return accessToken, nil
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return OAuthTokenSet{}, fmt.Errorf("刷新 access token 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return OAuthTokenSet{}, fmt.Errorf("read refresh response: %w", err)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return OAuthTokenSet{}, fmt.Errorf("解析刷新响应失败")
+	}
+
+	tokenSet, err := parseTokenSet(result)
+	if err != nil {
+		return OAuthTokenSet{}, err
+	}
+	if tokenSet.RefreshToken == "" {
+		tokenSet.RefreshToken = refreshToken
+	}
+	return tokenSet, nil
 }
 
 // ensureDynamicClient performs MCP OAuth 2.1 dynamic client registration if needed.
@@ -271,9 +348,9 @@ func (s *OAuthService) ensureDynamicClient(provider string, pcfg *providerConfig
 
 	regBody := map[string]any{
 		"client_name":                "LiteFlow",
-		"redirect_uris":             []string{s.callbackURL},
-		"grant_types":               []string{"authorization_code", "refresh_token"},
-		"response_types":            []string{"code"},
+		"redirect_uris":              []string{s.callbackURL},
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"response_types":             []string{"code"},
 		"token_endpoint_auth_method": "client_secret_basic",
 	}
 
@@ -326,4 +403,43 @@ func generateCodeVerifier() string {
 func generateCodeChallenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func parseTokenSet(result map[string]any) (OAuthTokenSet, error) {
+	if errField, ok := result["error"].(string); ok && errField != "" {
+		desc, _ := result["error_description"].(string)
+		if desc == "" {
+			desc = errField
+		}
+		return OAuthTokenSet{}, fmt.Errorf("OAuth 授权失败: %s", desc)
+	}
+
+	accessToken, _ := result["access_token"].(string)
+	if accessToken == "" {
+		return OAuthTokenSet{}, fmt.Errorf("未获取到访问令牌")
+	}
+	refreshToken, _ := result["refresh_token"].(string)
+
+	var expiresIn int64
+	switch v := result["expires_in"].(type) {
+	case float64:
+		expiresIn = int64(v)
+	case int64:
+		expiresIn = v
+	case int:
+		expiresIn = int64(v)
+	case string:
+		if v != "" {
+			parsed, err := strconv.ParseInt(v, 10, 64)
+			if err == nil {
+				expiresIn = parsed
+			}
+		}
+	}
+
+	return OAuthTokenSet{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresIn:    expiresIn,
+	}, nil
 }
