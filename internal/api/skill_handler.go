@@ -26,6 +26,6 @@ func (h *SkillHandler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.skillRegistry.Search(query)
+	result := h.skillRegistry.Search(query, nil)
 	OK(w, map[string]string{"result": result})
 }

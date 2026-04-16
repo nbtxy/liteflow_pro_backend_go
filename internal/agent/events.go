@@ -3,15 +3,18 @@ package agent
 type EventType string
 
 const (
-	EventStreamStart    EventType = "stream_start"
-	EventStreamEnd      EventType = "stream_end"
-	EventTextDelta      EventType = "text_delta"
-	EventToolUseStart   EventType = "tool_use_start"
-	EventToolUseInput   EventType = "tool_use_input"
-	EventToolResult     EventType = "tool_result"
-	EventArtifactCreate EventType = "artifact_created"
-	EventArtifactUpdate EventType = "artifact_updated"
-	EventError          EventType = "error"
+	EventStreamStart     EventType = "stream_start"
+	EventStreamEnd       EventType = "stream_end"
+	EventTextDelta       EventType = "text_delta"
+	EventToolUseStart    EventType = "tool_use_start"
+	EventToolUseInput    EventType = "tool_use_input"
+	EventToolResult      EventType = "tool_result"
+	EventDelegationStart EventType = "delegation_start"
+	EventDelegationDelta EventType = "delegation_delta"
+	EventDelegationEnd   EventType = "delegation_end"
+	EventArtifactCreate  EventType = "artifact_created"
+	EventArtifactUpdate  EventType = "artifact_updated"
+	EventError           EventType = "error"
 )
 
 type Event struct {

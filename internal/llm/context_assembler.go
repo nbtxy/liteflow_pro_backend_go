@@ -28,6 +28,17 @@ type ContextAssembler struct {
 	hasTools       bool
 }
 
+type AssembleOptions struct {
+	Provider             Provider
+	ToolDefs             []ToolDefinition
+	PromptModules        []string
+	SystemPromptOverride string
+	UserName             string
+	Temperature          *float64
+	MaxTokens            int
+	Model                string
+}
+
 func NewContextAssembler(
 	templateEngine *PromptTemplateEngine,
 	providerRouter *ProviderRouter,
@@ -46,25 +57,50 @@ func NewContextAssembler(
 }
 
 func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID string,
-	memoryContext string, toolSearchDescription string) *LlmRequest {
+	memoryContext string, toolSearchDescription string, opts *AssembleOptions) *LlmRequest {
+
+	selectedProvider := ca.providerRouter.Default()
+	if opts != nil && opts.Provider != nil {
+		selectedProvider = opts.Provider
+	}
+
+	defs := ca.toolDefs
+	if opts != nil && opts.ToolDefs != nil {
+		defs = opts.ToolDefs
+	}
+	hasTools := len(defs) > 0
+	hasMemoryManageTool := hasToolDefinition(defs, "memory_manage")
+
+	userName := "Developer"
+	if opts != nil && strings.TrimSpace(opts.UserName) != "" {
+		userName = strings.TrimSpace(opts.UserName)
+	}
 
 	variables := map[string]string{
 		"current_time": time.Now().Format(time.RFC3339),
-		"user_name":    "Developer",
+		"user_name":    userName,
 	}
 
 	modules := []string{
 		"base-persona",
+		"runtime-context",
 		"formatting-rules",
 		"conversation-rules",
 		"safety-boundaries",
 	}
 
-	if ca.hasTools {
+	if opts != nil && opts.PromptModules != nil {
+		modules = opts.PromptModules
+	}
+
+	if hasMemoryManageTool {
 		modules = append(modules, "memory-guidance")
 	}
 
 	systemPrompt := ca.templateEngine.Assemble(modules, variables)
+	if opts != nil && strings.TrimSpace(opts.SystemPromptOverride) != "" {
+		systemPrompt += "\n\n" + strings.TrimSpace(opts.SystemPromptOverride)
+	}
 
 	if memoryContext != "" {
 		systemPrompt += "\n\n" + memoryContext
@@ -72,17 +108,16 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 
 	systemTokens := estimateTokens(systemPrompt)
 
-	provider := ca.providerRouter.Default()
 	maxContext := 64000
 	visionSupported := false
-	if provider != nil {
-		maxContext = provider.MaxContextTokens()
-		visionSupported = provider.SupportsVision()
+	if selectedProvider != nil {
+		maxContext = selectedProvider.MaxContextTokens()
+		visionSupported = selectedProvider.SupportsVision()
 	}
 
 	toolTokens := 0
-	if ca.hasTools {
-		toolTokens = ToolDefinitionsTokenEstimate
+	if hasTools {
+		toolTokens = estimateToolDefinitionsTokens(defs)
 	}
 	if toolSearchDescription != "" {
 		toolTokens += estimateTokens(toolSearchDescription)
@@ -121,13 +156,23 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 		Temperature: floatPtr(0.0),
 		Stream:      true,
 	}
+	if opts != nil {
+		if opts.MaxTokens > 0 {
+			req.MaxTokens = opts.MaxTokens
+		}
+		if opts.Temperature != nil {
+			req.Temperature = opts.Temperature
+		}
+		if strings.TrimSpace(opts.Model) != "" {
+			req.Model = strings.TrimSpace(opts.Model)
+		}
+	}
 
 	if len(req.Messages) == 0 || req.Messages[0].Role != "system" {
 		req.Messages = append([]LlmMessage{{Role: "system", Content: systemPrompt}}, req.Messages...)
 	}
 
-	if ca.hasTools {
-		defs := ca.toolDefs
+	if hasTools {
 		if toolSearchDescription != "" {
 			defs = overrideActiveMcpDescription(defs, toolSearchDescription)
 		}
@@ -138,7 +183,8 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 		"systemPromptTokens", systemTokens,
 		"historyMessages", len(llmHistory),
 		"historyBudget", historyBudget,
-		"toolCount", len(ca.toolDefs),
+		"toolCount", len(defs),
+		"hasMemoryManageTool", hasMemoryManageTool,
 		"hasMemory", memoryContext != "",
 	)
 
@@ -575,7 +621,54 @@ func detectDataURLExt(header string) string {
 }
 
 func estimateTokens(text string) int {
-	return len(text)
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+
+	asciiCount := 0
+	nonASCII := 0
+	for _, r := range text {
+		if r <= 0x7F {
+			asciiCount++
+			continue
+		}
+		nonASCII++
+	}
+
+	asciiTokens := (asciiCount + 3) / 4
+	total := asciiTokens + nonASCII
+	if total <= 0 {
+		return 1
+	}
+	return total
+}
+
+func estimateToolDefinitionsTokens(defs []ToolDefinition) int {
+	if len(defs) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(defs)
+	if err != nil {
+		return ToolDefinitionsTokenEstimate
+	}
+	estimated := estimateTokens(string(b))
+	if estimated <= 0 {
+		return ToolDefinitionsTokenEstimate
+	}
+	return estimated
+}
+
+func hasToolDefinition(defs []ToolDefinition, toolName string) bool {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		return false
+	}
+	for _, td := range defs {
+		if strings.TrimSpace(td.Function.Name) == name {
+			return true
+		}
+	}
+	return false
 }
 
 func floatPtr(v float64) *float64 {

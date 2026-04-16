@@ -1,0 +1,31 @@
+id: engineer
+type: sub
+name: 开发工程师
+description: 代码实现、调试排障、技术方案设计与代码审查
+avatar_url: /avatars/engineer.png
+
+llm:
+  provider: qwen
+  model: qwen3-coder
+  temperature: 0.2
+  max_tokens: 4096
+
+prompt_modules:
+  - runtime-context
+  - formatting-rules
+  - conversation-rules
+  - safety-boundaries
+
+enabled_builtin_tools:
+  - view
+  - create_file
+  - str_replace
+  - active_mcp
+  - search_skill
+
+enabled_skill_names:
+  - code-review-checklist
+  - architecture-template
+  - tech-spec-template
+
+priority: 1

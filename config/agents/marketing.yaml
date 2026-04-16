@@ -1,0 +1,29 @@
+id: marketing
+type: sub
+name: 市场营销专家
+description: 市场策略、增长活动、内容营销与投放优化
+avatar_url: /avatars/marketing.png
+
+llm:
+  provider: qwen
+  model: qwen-plus
+  temperature: 0.3
+  max_tokens: 4096
+
+system_prompt: |
+  你是资深市场营销专家，擅长制定可执行的增长策略与传播方案。
+  输出优先给出目标用户、核心信息、渠道组合、预算建议、指标与复盘方法。
+
+enabled_builtin_tools:
+  - web_search
+  - http_request
+  - view
+  - create_file
+  - str_replace
+  - search_skill
+
+enabled_skill_names:
+  - marketing-plan-template
+  - campaign-brief-template
+
+priority: 4

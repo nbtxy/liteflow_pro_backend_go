@@ -1,0 +1,13 @@
+id: main
+type: main
+name: LiteFlow 助手
+description: 主协调 Agent，负责理解用户意图并在需要时委派子任务
+avatar_url: /avatars/main.png
+
+llm:
+  provider: deepseek
+  model: deepseek-chat
+  temperature: 0.0
+  max_tokens: 4096
+
+priority: 0

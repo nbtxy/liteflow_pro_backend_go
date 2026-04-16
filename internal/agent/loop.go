@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/liteflow/backend/internal/agent_profile"
 	"github.com/liteflow/backend/internal/llm"
 	"github.com/liteflow/backend/internal/tool"
 )
@@ -19,10 +20,14 @@ const (
 	MaxToolResult = 200000
 )
 
-type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string) ([]tool.Tool, error)
+type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error)
 type ExecuteOptions struct {
-	MCPMode        string
-	ActivatedTools []string
+	MCPMode                string
+	ActivatedTools         []string
+	ToolPool               map[string]tool.Tool
+	AllowedMcpChannelNames []string
+	AgentRuntime           *agent_profile.AgentRuntime
+	MaxTurns               int
 }
 
 type AgentLoop struct {
@@ -63,11 +68,15 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 	toolCtx *tool.ToolContext, usageAcc *llm.LlmUsage, events chan<- Event, opts *ExecuteOptions) {
 
 	normalTools := req.Tools
+	allowedMcpChannels := []string(nil)
+	if opts != nil {
+		allowedMcpChannels = opts.AllowedMcpChannelNames
+	}
 	activatedMcpTools := make(map[string]tool.Tool)
 	mcpModeActive := false
 	if opts != nil && strings.EqualFold(opts.MCPMode, "active") && len(opts.ActivatedTools) > 0 {
 		if a.mcpExecBuilder != nil && toolCtx.UserID != uuid.Nil {
-			executors, err := a.mcpExecBuilder(ctx, toolCtx.UserID.String(), opts.ActivatedTools)
+			executors, err := a.mcpExecBuilder(ctx, toolCtx.UserID.String(), opts.ActivatedTools, allowedMcpChannels)
 			if err != nil {
 				slog.Warn("failed to restore MCP executors", "err", err)
 			} else {
@@ -85,14 +94,18 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		}
 	}
 
-	for iteration := 0; iteration < MaxIterations; iteration++ {
+	maxTurns := MaxIterations
+	if opts != nil && opts.MaxTurns > 0 && opts.MaxTurns < MaxIterations {
+		maxTurns = opts.MaxTurns
+	}
+	for iteration := 0; iteration < maxTurns; iteration++ {
 		if ctx.Err() != nil {
 			return
 		}
 
 		slog.Info("agent loop iteration start", "iteration", iteration)
 
-		accumulators, iterContent, err := a.streamLLMResponse(ctx, req, usageAcc, events)
+		accumulators, iterContent, err := a.streamLLMResponse(ctx, req, usageAcc, events, opts)
 		if err != nil {
 			events <- ErrorEvent("agent_loop_error", "工具调用出错: "+err.Error())
 			return
@@ -120,10 +133,9 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		nextMcpMode := mcpModeActive
 
 		for _, tc := range toolCalls {
-			toolEvents, toolResultMsg, result := a.executeOneToolCallWithResult(ctx, tc, toolCtx, activatedMcpTools)
-			for _, ev := range toolEvents {
+			toolResultMsg, result := a.executeOneToolCallWithResult(ctx, tc, toolCtx, activatedMcpTools, opts, func(ev Event) {
 				events <- ev
-			}
+			})
 			req.Messages = append(req.Messages, toolResultMsg)
 
 			if result != nil && result.Metadata != nil {
@@ -142,7 +154,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		}
 
 		if nextMcpMode && len(newlyActivated) > 0 && a.mcpExecBuilder != nil && toolCtx.UserID != uuid.Nil {
-			executors, err := a.mcpExecBuilder(ctx, toolCtx.UserID.String(), newlyActivated)
+			executors, err := a.mcpExecBuilder(ctx, toolCtx.UserID.String(), newlyActivated, allowedMcpChannels)
 			if err != nil {
 				slog.Warn("failed to build MCP executors", "err", err)
 			} else {
@@ -169,7 +181,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		}
 	}
 
-	slog.Warn("agent loop reached max iterations", "max", MaxIterations)
+	slog.Warn("agent loop reached max iterations", "max", maxTurns)
 	events <- TextDeltaEvent("已达到最大工具调用次数，以下是基于已有信息的回答。")
 }
 
@@ -189,9 +201,12 @@ func (a *AgentLoop) buildMcpActiveToolDefs(_ []llm.ToolDefinition, mcpTools map[
 }
 
 func (a *AgentLoop) streamLLMResponse(ctx context.Context, req *llm.LlmRequest,
-	usageAcc *llm.LlmUsage, events chan<- Event) (map[int]*toolCallAccumulator, string, error) {
+	usageAcc *llm.LlmUsage, events chan<- Event, opts *ExecuteOptions) (map[int]*toolCallAccumulator, string, error) {
 
 	provider := a.providerRouter.Default()
+	if opts != nil && opts.AgentRuntime != nil && opts.AgentRuntime.Provider != nil {
+		provider = opts.AgentRuntime.Provider
+	}
 	if provider == nil {
 		return nil, "", nil
 	}
@@ -278,9 +293,7 @@ func toToolCallSlice(calls []toolCallInfo) []llm.ToolCall {
 }
 
 func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCallInfo,
-	toolCtx *tool.ToolContext, mcpTools map[string]tool.Tool) ([]Event, llm.LlmMessage, *tool.ToolResult) {
-
-	var events []Event
+	toolCtx *tool.ToolContext, mcpTools map[string]tool.Tool, opts *ExecuteOptions, emit func(Event)) (llm.LlmMessage, *tool.ToolResult) {
 
 	slog.Info("tool executing", "toolName", tc.name, "callId", tc.id)
 
@@ -292,10 +305,22 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		argsParseErr = err
 	}
 
-	events = append(events, ToolUseStartEvent(tc.id, tc.name))
-	events = append(events, ToolUseInputEvent(tc.id, input))
+	emit(ToolUseStartEvent(tc.id, tc.name))
+	emit(ToolUseInputEvent(tc.id, input))
 
-	t := a.toolRegistry.Get(tc.name)
+	if tc.name == "search_skill" && opts != nil && opts.AgentRuntime != nil && opts.AgentRuntime.EnabledSkills != nil {
+		if _, exists := input["whitelist"]; !exists {
+			input["whitelist"] = opts.AgentRuntime.EnabledSkills
+		}
+	}
+
+	t := tool.Tool(nil)
+	if opts != nil && opts.ToolPool != nil {
+		t = opts.ToolPool[tc.name]
+	}
+	if t == nil {
+		t = a.toolRegistry.Get(tc.name)
+	}
 	if t == nil {
 		t = mcpTools[tc.name]
 	}
@@ -314,6 +339,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	} else {
 		execCtx, cancel := context.WithTimeout(ctx, ToolTimeout)
 		defer cancel()
+		execCtx = WithEventSink(execCtx, emit)
 
 		var err error
 		result, err = t.Execute(execCtx, input, toolCtx)
@@ -336,11 +362,13 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		"durationMs", durationMs,
 	)
 
-	events = append(events, ToolResultEvent(tc.id, status, resultContent, result.Metadata))
+	emit(ToolResultEvent(tc.id, status, resultContent, result.Metadata))
 
 	if result.Metadata != nil {
 		if artifactEvents := buildArtifactEvents(result.Metadata, tc.name, input); len(artifactEvents) > 0 {
-			events = append(events, artifactEvents...)
+			for _, ev := range artifactEvents {
+				emit(ev)
+			}
 		}
 	}
 
@@ -351,7 +379,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		Name:       tc.name,
 	}
 
-	return events, toolResultMsg, result
+	return toolResultMsg, result
 }
 
 func buildArtifactEvents(metadata map[string]any, toolName string, input map[string]any) []Event {

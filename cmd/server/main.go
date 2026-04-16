@@ -15,6 +15,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/liteflow/backend/internal/admin"
 	"github.com/liteflow/backend/internal/agent"
+	"github.com/liteflow/backend/internal/agent_profile"
 	"github.com/liteflow/backend/internal/api"
 	"github.com/liteflow/backend/internal/artifact"
 	"github.com/liteflow/backend/internal/auth"
@@ -168,13 +169,28 @@ func main() {
 	toolRegistry.Register(tool.NewWebSearch(searchRouter))
 	toolRegistry.Register(tool.NewActiveMCP(mcpSvc.ActivateByPlatform))
 	toolRegistry.Register(tool.NewMemoryManage(memorySvc.ManageTool))
-	toolRegistry.Register(tool.NewSearchSkill(skillRegistry.Search))
+	toolRegistry.Register(tool.NewSearchSkill(skillRegistry.Search, func() []string {
+		all := skillRegistry.All()
+		names := make([]string, 0, len(all))
+		for _, s := range all {
+			if s != nil && s.Name != "" {
+				names = append(names, s.Name)
+			}
+		}
+		return names
+	}))
 	toolRegistry.Register(tool.NewManageScheduledTask(taskScheduler.ManageTool))
 	toolRegistry.Register(tool.NewCreateFile(storageSvc, artifactSvc.CreateFileArtifact))
 	toolRegistry.Register(tool.NewStrReplace(storageSvc, artifactSvc.CreateFileArtifact))
 	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
 	toolRegistry.Register(tool.NewDownloadFile(storageSvc, artifactSvc.CreateFileArtifact))
+	agentRegistry, err := agent_profile.LoadFromDir("./config/agents")
+	if err != nil {
+		slog.Error("failed to load agent yaml config", "err", err)
+		os.Exit(1)
+	}
+	agentSvc := agent_profile.NewService(agentRegistry, providerRouter, toolRegistry)
 
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()
@@ -183,12 +199,12 @@ func main() {
 
 	// Agent Loop
 	agentLoop := agent.NewAgentLoop(providerRouter, toolRegistry)
-	agentLoop.SetMcpExecutorBuilder(func(ctx context.Context, userIDStr string, displayNames []string) ([]tool.Tool, error) {
+	agentLoop.SetMcpExecutorBuilder(func(ctx context.Context, userIDStr string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error) {
 		uid, err := uuid.Parse(userIDStr)
 		if err != nil {
 			return nil, err
 		}
-		mcpTools, err := mcpSvc.GetToolsByDisplayNames(ctx, uid, displayNames)
+		mcpTools, err := mcpSvc.GetToolsByDisplayNames(ctx, uid, displayNames, allowedChannelNames)
 		if err != nil {
 			return nil, err
 		}
@@ -205,7 +221,7 @@ func main() {
 	})
 
 	// Chat Service
-	chatSvc := chat.NewService(providerRouter, contextAsm, toolRegistry, agentLoop, convSvc, usageSvc)
+	chatSvc := chat.NewService(providerRouter, contextAsm, toolRegistry, agentLoop, convSvc, agentSvc, userSvc, memorySvc, usageSvc)
 	chatSvc.SetTaskScheduler(taskScheduler)
 
 	// Feishu IM Bot
@@ -242,6 +258,7 @@ func main() {
 		FeedbackHandler: api.NewFeedbackHandler(feedbackSvc),
 		UsageHandler:    api.NewUsageHandler(usageSvc),
 		AdminHandler:    api.NewAdminHandler(adminSvc),
+		AgentHandler:    api.NewAgentHandler(agentSvc),
 		SkillHandler:    api.NewSkillHandler(skillRegistry),
 		TaskHandler:     api.NewTaskHandler(taskScheduler, taskExecutor),
 		ChannelHandler:  api.NewChannelHandler(channelMgr, oauthSvc),

@@ -1,0 +1,29 @@
+id: researcher
+type: sub
+name: 研究分析师
+description: 资料检索、事实核查、对比分析与结构化结论整理
+avatar_url: /avatars/researcher.png
+
+llm:
+  provider: qwen
+  model: qwen-plus
+  temperature: 0.1
+  max_tokens: 4096
+
+system_prompt: |
+  你是研究分析师，重视事实与来源可靠性。
+  回答时先给结论，再给关键证据与不确定性说明。
+
+enabled_builtin_tools:
+  - web_search
+  - http_request
+  - view
+  - create_file
+  - str_replace
+  - search_skill
+
+enabled_skill_names:
+  - research-report-template
+  - compare-options-template
+
+priority: 3

@@ -3,18 +3,22 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/liteflow/backend/internal/agent"
+	"github.com/liteflow/backend/internal/agent_profile"
 	"github.com/liteflow/backend/internal/conversation"
 	"github.com/liteflow/backend/internal/domain"
 	"github.com/liteflow/backend/internal/llm"
+	"github.com/liteflow/backend/internal/memory"
 	"github.com/liteflow/backend/internal/task"
 	"github.com/liteflow/backend/internal/tool"
 	"github.com/liteflow/backend/internal/usage"
+	"github.com/liteflow/backend/internal/user"
 )
 
 type Service struct {
@@ -23,6 +27,9 @@ type Service struct {
 	toolRegistry   *tool.Registry
 	agentLoop      *agent.AgentLoop
 	convSvc        *conversation.Service
+	agentSvc       *agent_profile.Service
+	userSvc        *user.Service
+	memorySvc      *memory.Service
 	usageSvc       *usage.Service
 	taskScheduler  *task.Scheduler
 }
@@ -33,16 +40,26 @@ func NewService(
 	toolRegistry *tool.Registry,
 	agentLoop *agent.AgentLoop,
 	convSvc *conversation.Service,
+	agentSvc *agent_profile.Service,
+	userSvc *user.Service,
+	memorySvc *memory.Service,
 	usageSvc *usage.Service,
 ) *Service {
-	return &Service{
+	svc := &Service{
 		providerRouter: providerRouter,
 		contextAsm:     contextAsm,
 		toolRegistry:   toolRegistry,
 		agentLoop:      agentLoop,
 		convSvc:        convSvc,
+		agentSvc:       agentSvc,
+		userSvc:        userSvc,
+		memorySvc:      memorySvc,
 		usageSvc:       usageSvc,
 	}
+	if agentSvc != nil {
+		agentSvc.SetDelegateRunner(svc.runSubAgent)
+	}
+	return svc
 }
 
 func (s *Service) SetTaskScheduler(ts *task.Scheduler) {
@@ -52,6 +69,7 @@ func (s *Service) SetTaskScheduler(ts *task.Scheduler) {
 type ChatRequest struct {
 	ConversationID string            `json:"conversationId"`
 	Message        string            `json:"message"`
+	AgentID        string            `json:"agentId,omitempty"`
 	Attachments    []json.RawMessage `json:"attachments,omitempty"`
 	QuotedMessage  json.RawMessage   `json:"quotedMessage,omitempty"`
 }
@@ -90,9 +108,33 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		}
 	}
 
+	selectedAgentID := s.resolveRequestedAgentID(req)
+	if selectedAgentID == "" {
+		if lastAgentMsg, lastErr := s.convSvc.GetLastAgentMessage(ctx, conv.ID); lastErr == nil && lastAgentMsg != nil && lastAgentMsg.AgentID != nil {
+			selectedAgentID = *lastAgentMsg.AgentID
+		}
+	}
+
+	rt := s.newDefaultRuntime()
+	if s.agentSvc != nil {
+		agentRT, resolveErr := s.agentSvc.Resolve(ctx, selectedAgentID)
+		if resolveErr != nil {
+			events <- agent.ErrorEvent("invalid_agent", "无效的Agent配置")
+			return
+		}
+		rt = agentRT
+	}
+	var resolvedAgentID *string
+	if rt != nil && strings.TrimSpace(rt.AgentID) != "" {
+		aid := rt.AgentID
+		resolvedAgentID = &aid
+	}
+
 	userMsg := &domain.Message{
 		ConversationID: conv.ID,
 		Role:           "user",
+		SenderType:     "user",
+		AgentID:        resolvedAgentID,
 		Content:        req.Message,
 		CreatedAt:      time.Now(),
 	}
@@ -131,13 +173,25 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		mcpState = state
 	}
 
-	llmReq := s.contextAsm.Assemble(history, conv.ID.String(), "", "")
+	memoryContext := s.buildMemoryContext(ctx, userID)
+	llmReq := s.contextAsm.Assemble(history, conv.ID.String(), memoryContext, "", &llm.AssembleOptions{
+		Provider:             rt.Provider,
+		ToolDefs:             rt.ToolDefs,
+		PromptModules:        rt.PromptModules,
+		SystemPromptOverride: rt.SystemPromptOverride,
+		UserName:             s.resolvePromptUserName(ctx, userID),
+		Temperature:          rt.Temperature,
+		MaxTokens:            rt.MaxTokens,
+		Model:                rt.Model,
+	})
 
 	assistantMsgID := uuid.New()
 	assistantMsg := &domain.Message{
 		ID:             assistantMsgID,
 		ConversationID: conv.ID,
 		Role:           "assistant",
+		SenderType:     "agent",
+		AgentID:        resolvedAgentID,
 		Content:        "",
 		CreatedAt:      time.Now(),
 	}
@@ -158,7 +212,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	var contentParts []map[string]any
 	toolUseIndex := make(map[string]map[string]any)
 
-	hasTools := len(s.toolRegistry.All()) > 0
+	hasTools := rt != nil && len(rt.EnabledToolSet) > 0
 	var purpose string
 	if hasTools {
 		purpose = "chat_with_tools"
@@ -176,8 +230,11 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		var textAccum strings.Builder // accumulate text between tool calls
 
 		agentEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
-			MCPMode:        currentMcpState.Mode,
-			ActivatedTools: currentMcpState.ActivatedTools,
+			MCPMode:                currentMcpState.Mode,
+			ActivatedTools:         currentMcpState.ActivatedTools,
+			ToolPool:               rt.EnabledToolSet,
+			AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
+			AgentRuntime:           rt,
 		})
 		for ev := range agentEvents {
 			switch ev.Type {
@@ -233,6 +290,27 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 					"status":    status,
 					"content":   content,
 				})
+			case agent.EventDelegationStart:
+				contentParts = append(contentParts, map[string]any{
+					"type":         "delegation_start",
+					"subAgentId":   ev.Data["subAgentId"],
+					"subAgentName": ev.Data["subAgentName"],
+					"task":         ev.Data["task"],
+				})
+			case agent.EventDelegationDelta:
+				contentParts = append(contentParts, map[string]any{
+					"type":         "delegation_delta",
+					"subAgentId":   ev.Data["subAgentId"],
+					"subAgentName": ev.Data["subAgentName"],
+					"content":      ev.Data["content"],
+				})
+			case agent.EventDelegationEnd:
+				contentParts = append(contentParts, map[string]any{
+					"type":         "delegation_end",
+					"subAgentId":   ev.Data["subAgentId"],
+					"subAgentName": ev.Data["subAgentName"],
+					"result":       ev.Data["result"],
+				})
 			}
 			events <- ev
 		}
@@ -247,6 +325,9 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	} else {
 		purpose = "chat"
 		provider := s.providerRouter.Default()
+		if rt != nil && rt.Provider != nil {
+			provider = rt.Provider
+		}
 		if provider == nil {
 			events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
 			return
@@ -271,8 +352,9 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 	var metadata json.RawMessage
 	metaMap := map[string]any{}
-	if len(contentParts) > 0 {
-		metaMap["contentParts"] = contentParts
+	normalizedParts := normalizeContentParts(contentParts)
+	if len(normalizedParts) > 0 {
+		metaMap["contentParts"] = normalizedParts
 	}
 	if len(metaMap) > 0 {
 		if metaBytes, err := json.Marshal(metaMap); err == nil {
@@ -293,7 +375,9 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 	if s.usageSvc != nil {
 		providerName := ""
-		if p := s.providerRouter.Default(); p != nil {
+		if rt != nil && rt.Provider != nil {
+			providerName = rt.Provider.Name()
+		} else if p := s.providerRouter.Default(); p != nil {
 			providerName = p.Name()
 		}
 		s.usageSvc.RecordAsync(ctx, userID, conv.ID, assistantMsgID,
@@ -308,6 +392,143 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 			"output_tokens": usageAcc.OutputTokens,
 		},
 	})
+}
+
+func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, taskText, extraContext string, parentTC *tool.ToolContext) (string, error) {
+	if s.agentSvc == nil {
+		return "", nil
+	}
+	agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationStart, map[string]any{
+		"subAgentId":   subAgentID,
+		"subAgentName": subAgentName,
+		"task":         taskText,
+	}))
+
+	rt, err := s.agentSvc.Resolve(ctx, subAgentID)
+	if err != nil {
+		return "", err
+	}
+	if rt == nil || rt.Provider == nil {
+		return "", nil
+	}
+	var subAgentRef *string
+	if strings.TrimSpace(rt.AgentID) != "" {
+		id := rt.AgentID
+		subAgentRef = &id
+	}
+	var parentMessageID *uuid.UUID
+	if parentTC != nil && parentTC.MessageID != uuid.Nil {
+		pid := parentTC.MessageID
+		parentMessageID = &pid
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString("任务：\n")
+	prompt.WriteString(taskText)
+	if strings.TrimSpace(extraContext) != "" {
+		prompt.WriteString("\n\n额外上下文：\n")
+		prompt.WriteString(strings.TrimSpace(extraContext))
+	}
+
+	conversationID := ""
+	if parentTC != nil && parentTC.ConversationID != uuid.Nil {
+		conversationID = parentTC.ConversationID.String()
+	}
+	inputMsg := domain.Message{
+		ID:              uuid.New(),
+		Role:            "user",
+		SenderType:      "agent",
+		AgentID:         subAgentRef,
+		Content:         prompt.String(),
+		CreatedAt:       time.Now(),
+		ParentMessageID: parentMessageID,
+		IsInternal:      true,
+	}
+	if parentTC != nil && parentTC.ConversationID != uuid.Nil {
+		inputMsg.ConversationID = parentTC.ConversationID
+		if s.convSvc != nil {
+			_ = s.convSvc.SaveMessage(ctx, &inputMsg)
+		}
+	}
+	subAgentUserID := ""
+	if parentTC != nil && parentTC.UserID != uuid.Nil {
+		subAgentUserID = parentTC.UserID.String()
+	}
+	subAgentUserName := "Developer"
+	if subAgentUserID != "" {
+		if parsedID, parseErr := uuid.Parse(subAgentUserID); parseErr == nil {
+			subAgentUserName = s.resolvePromptUserName(ctx, parsedID)
+		}
+	}
+	subAgentMemoryContext := ""
+	if parentTC != nil && parentTC.UserID != uuid.Nil {
+		subAgentMemoryContext = s.buildMemoryContext(ctx, parentTC.UserID)
+	}
+	llmReq := s.contextAsm.Assemble([]domain.Message{inputMsg}, conversationID, subAgentMemoryContext, "", &llm.AssembleOptions{
+		Provider:             rt.Provider,
+		ToolDefs:             rt.ToolDefs,
+		PromptModules:        rt.PromptModules,
+		SystemPromptOverride: rt.SystemPromptOverride,
+		UserName:             subAgentUserName,
+		Temperature:          rt.Temperature,
+		MaxTokens:            rt.MaxTokens,
+		Model:                rt.Model,
+	})
+
+	toolCtx := &tool.ToolContext{}
+	if parentTC != nil {
+		toolCtx.ConversationID = parentTC.ConversationID
+		toolCtx.UserID = parentTC.UserID
+		toolCtx.MessageID = parentTC.MessageID
+	}
+
+	usageAcc := &llm.LlmUsage{}
+	subEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
+		ToolPool:               rt.EnabledToolSet,
+		AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
+		AgentRuntime:           rt,
+		MaxTurns:               20,
+	})
+
+	var out strings.Builder
+	for ev := range subEvents {
+		switch ev.Type {
+		case agent.EventTextDelta:
+			if c, ok := ev.Data["content"].(string); ok {
+				out.WriteString(c)
+				agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationDelta, map[string]any{
+					"subAgentId":   subAgentID,
+					"subAgentName": subAgentName,
+					"content":      c,
+				}))
+			}
+		case agent.EventError:
+			msg, _ := ev.Data["message"].(string)
+			return "", errors.New(msg)
+		}
+	}
+
+	result := strings.TrimSpace(out.String())
+	if s.convSvc != nil && parentTC != nil && parentTC.ConversationID != uuid.Nil {
+		internalResult := &domain.Message{
+			ID:              uuid.New(),
+			ConversationID:  parentTC.ConversationID,
+			Role:            "assistant",
+			SenderType:      "agent",
+			AgentID:         subAgentRef,
+			Content:         result,
+			CreatedAt:       time.Now(),
+			ParentMessageID: parentMessageID,
+			IsInternal:      true,
+		}
+		_ = s.convSvc.SaveMessage(ctx, internalResult)
+	}
+	agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationEnd, map[string]any{
+		"subAgentId":   subAgentID,
+		"subAgentName": subAgentName,
+		"result":       result,
+	}))
+	return result, nil
 }
 
 func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage string, userID uuid.UUID) {
@@ -377,6 +598,57 @@ func parseStringPointer(v any) *string {
 	return &s
 }
 
+func (s *Service) resolveRequestedAgentID(req ChatRequest) string {
+	if strings.TrimSpace(req.AgentID) != "" {
+		return strings.TrimSpace(req.AgentID)
+	}
+	return ""
+}
+
+func (s *Service) resolvePromptUserName(ctx context.Context, userID uuid.UUID) string {
+	if s.userSvc == nil || userID == uuid.Nil {
+		return "Developer"
+	}
+	u, err := s.userSvc.GetByID(ctx, userID)
+	if err != nil || u == nil {
+		return "Developer"
+	}
+	if u.Name != nil {
+		if name := strings.TrimSpace(*u.Name); name != "" {
+			return name
+		}
+	}
+	if phone := strings.TrimSpace(u.Phone); phone != "" {
+		return phone
+	}
+	return "Developer"
+}
+
+func (s *Service) buildMemoryContext(ctx context.Context, userID uuid.UUID) string {
+	if s == nil || s.memorySvc == nil || userID == uuid.Nil {
+		return ""
+	}
+	memories, err := s.memorySvc.GetFormattedMemories(ctx, userID)
+	if err != nil {
+		slog.Warn("failed to load memory context", "userId", userID, "err", err)
+		return ""
+	}
+	return strings.TrimSpace(memories)
+}
+
+func (s *Service) newDefaultRuntime() *agent_profile.AgentRuntime {
+	tools := make(map[string]tool.Tool)
+	for _, t := range s.toolRegistry.All() {
+		tools[t.Name()] = t
+	}
+	return &agent_profile.AgentRuntime{
+		AgentName:      "Assistant",
+		Provider:       s.providerRouter.Default(),
+		ToolDefs:       s.toolRegistry.BuildToolDefinitions(),
+		EnabledToolSet: tools,
+	}
+}
+
 func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID) <-chan agent.Event {
 	events := make(chan agent.Event, 64)
 
@@ -398,6 +670,31 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		if err != nil || conv == nil {
 			events <- agent.ErrorEvent("forbidden", "会话不存在")
 			return
+		}
+
+		var selectedAgentID string
+		if oldMsg, oldErr := s.convSvc.GetMessageByID(ctx, msgID); oldErr == nil && oldMsg != nil && oldMsg.AgentID != nil {
+			selectedAgentID = *oldMsg.AgentID
+		}
+		if selectedAgentID == "" {
+			if lastAgentMsg, lastErr := s.convSvc.GetLastAgentMessage(ctx, convID); lastErr == nil && lastAgentMsg != nil && lastAgentMsg.AgentID != nil {
+				selectedAgentID = *lastAgentMsg.AgentID
+			}
+		}
+
+		rt := s.newDefaultRuntime()
+		if s.agentSvc != nil {
+			agentRT, resolveErr := s.agentSvc.Resolve(ctx, selectedAgentID)
+			if resolveErr != nil {
+				events <- agent.ErrorEvent("invalid_agent", "无效的Agent配置")
+				return
+			}
+			rt = agentRT
+		}
+		var resolvedAgentID *string
+		if rt != nil && strings.TrimSpace(rt.AgentID) != "" {
+			aid := rt.AgentID
+			resolvedAgentID = &aid
 		}
 
 		if s.taskScheduler != nil {
@@ -443,13 +740,25 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 		}
 
-		llmReq := s.contextAsm.Assemble(history, conversationID, "", "")
+		memoryContext := s.buildMemoryContext(ctx, userID)
+		llmReq := s.contextAsm.Assemble(history, conversationID, memoryContext, "", &llm.AssembleOptions{
+			Provider:             rt.Provider,
+			ToolDefs:             rt.ToolDefs,
+			PromptModules:        rt.PromptModules,
+			SystemPromptOverride: rt.SystemPromptOverride,
+			UserName:             s.resolvePromptUserName(ctx, userID),
+			Temperature:          rt.Temperature,
+			MaxTokens:            rt.MaxTokens,
+			Model:                rt.Model,
+		})
 
 		newMsgID := uuid.New()
 		assistantMsg := &domain.Message{
 			ID:             newMsgID,
 			ConversationID: convID,
 			Role:           "assistant",
+			SenderType:     "agent",
+			AgentID:        resolvedAgentID,
 			Content:        "",
 			CreatedAt:      time.Now(),
 		}
@@ -469,7 +778,7 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		var fullContent strings.Builder
 		var contentParts []map[string]any
 		toolUseIndex := make(map[string]map[string]any)
-		hasTools := len(s.toolRegistry.All()) > 0
+		hasTools := rt != nil && len(rt.EnabledToolSet) > 0
 		purpose := "chat"
 
 		if hasTools {
@@ -487,8 +796,11 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 			var textAccum strings.Builder
 			for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
-				MCPMode:        currentMcpState.Mode,
-				ActivatedTools: currentMcpState.ActivatedTools,
+				MCPMode:                currentMcpState.Mode,
+				ActivatedTools:         currentMcpState.ActivatedTools,
+				ToolPool:               rt.EnabledToolSet,
+				AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
+				AgentRuntime:           rt,
 			}) {
 				switch ev.Type {
 				case agent.EventTextDelta:
@@ -542,6 +854,27 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 						"status":    status,
 						"content":   content,
 					})
+				case agent.EventDelegationStart:
+					contentParts = append(contentParts, map[string]any{
+						"type":         "delegation_start",
+						"subAgentId":   ev.Data["subAgentId"],
+						"subAgentName": ev.Data["subAgentName"],
+						"task":         ev.Data["task"],
+					})
+				case agent.EventDelegationDelta:
+					contentParts = append(contentParts, map[string]any{
+						"type":         "delegation_delta",
+						"subAgentId":   ev.Data["subAgentId"],
+						"subAgentName": ev.Data["subAgentName"],
+						"content":      ev.Data["content"],
+					})
+				case agent.EventDelegationEnd:
+					contentParts = append(contentParts, map[string]any{
+						"type":         "delegation_end",
+						"subAgentId":   ev.Data["subAgentId"],
+						"subAgentName": ev.Data["subAgentName"],
+						"result":       ev.Data["result"],
+					})
 				}
 				events <- ev
 			}
@@ -554,6 +887,9 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 		} else {
 			provider := s.providerRouter.Default()
+			if rt != nil && rt.Provider != nil {
+				provider = rt.Provider
+			}
 			if provider == nil {
 				events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
 				return
@@ -580,8 +916,9 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 		// Build metadata
 		metaMap := map[string]any{}
-		if len(contentParts) > 0 {
-			metaMap["contentParts"] = contentParts
+		normalizedParts := normalizeContentParts(contentParts)
+		if len(normalizedParts) > 0 {
+			metaMap["contentParts"] = normalizedParts
 		}
 		if len(metaMap) > 0 {
 			if metaBytes, err := json.Marshal(metaMap); err == nil {
@@ -598,7 +935,9 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		durationMs := int32(time.Since(startTime).Milliseconds())
 		if s.usageSvc != nil {
 			providerName := ""
-			if p := s.providerRouter.Default(); p != nil {
+			if rt != nil && rt.Provider != nil {
+				providerName = rt.Provider.Name()
+			} else if p := s.providerRouter.Default(); p != nil {
 				providerName = p.Name()
 			}
 			s.usageSvc.RecordAsync(persistCtx, userID, convID, newMsgID,
@@ -614,4 +953,74 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 	}()
 
 	return events
+}
+
+func normalizeContentParts(parts []map[string]any) []map[string]any {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(parts))
+	for _, part := range parts {
+		typ := mapString(part, "type")
+		if typ == "" {
+			continue
+		}
+		switch typ {
+		case "text":
+			text := mapString(part, "text")
+			if text == "" {
+				continue
+			}
+			if len(out) > 0 && mapString(out[len(out)-1], "type") == "text" {
+				out[len(out)-1]["text"] = mapString(out[len(out)-1], "text") + text
+				continue
+			}
+			out = append(out, map[string]any{
+				"type": "text",
+				"text": text,
+			})
+		case "delegation_delta":
+			content := mapString(part, "content")
+			if content == "" {
+				continue
+			}
+			subAgentID := mapString(part, "subAgentId")
+			subAgentName := mapString(part, "subAgentName")
+			if len(out) > 0 && mapString(out[len(out)-1], "type") == "delegation_delta" &&
+				mapString(out[len(out)-1], "subAgentId") == subAgentID &&
+				mapString(out[len(out)-1], "subAgentName") == subAgentName {
+				out[len(out)-1]["content"] = mapString(out[len(out)-1], "content") + content
+				continue
+			}
+			out = append(out, map[string]any{
+				"type":         "delegation_delta",
+				"subAgentId":   subAgentID,
+				"subAgentName": subAgentName,
+				"content":      content,
+			})
+		case "tool_use", "tool_result", "delegation_start", "delegation_end":
+			normalized := map[string]any{"type": typ}
+			for k, v := range part {
+				if k == "type" {
+					continue
+				}
+				normalized[k] = v
+			}
+			out = append(out, normalized)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mapString(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	if v, ok := data[key].(string); ok {
+		return v
+	}
+	return ""
 }

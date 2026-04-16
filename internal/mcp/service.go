@@ -92,7 +92,8 @@ func (s *Service) ActivateByPlatform(ctx context.Context, userID fmt.Stringer, p
 }
 
 // GetToolsByDisplayNames returns McpTool records for the given display names.
-func (s *Service) GetToolsByDisplayNames(ctx context.Context, userID uuid.UUID, displayNames []string) ([]domain.McpTool, error) {
+// If allowedChannelNames is non-nil, only tools from allowed channel names are returned.
+func (s *Service) GetToolsByDisplayNames(ctx context.Context, userID uuid.UUID, displayNames []string, allowedChannelNames []string) ([]domain.McpTool, error) {
 	allTools, err := s.GetUserTools(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -103,8 +104,18 @@ func (s *Service) GetToolsByDisplayNames(ctx context.Context, userID uuid.UUID, 
 		nameSet[n] = true
 	}
 
+	allowed := map[string]bool{}
+	if allowedChannelNames != nil {
+		for _, name := range allowedChannelNames {
+			allowed[strings.ToLower(strings.TrimSpace(name))] = true
+		}
+	}
+
 	var matched []domain.McpTool
 	for _, t := range allTools {
+		if allowedChannelNames != nil && !allowed[strings.ToLower(strings.TrimSpace(t.ChannelName))] {
+			continue
+		}
 		if nameSet[t.DisplayName] {
 			matched = append(matched, t)
 		}

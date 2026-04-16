@@ -2,21 +2,33 @@ package tool
 
 import (
 	"context"
+	"strings"
 )
 
-type SkillSearchFunc func(query string) string
+type SkillSearchWithWhitelistFunc func(query string, whitelist []string) string
+type SkillListFunc func() []string
 
 type SearchSkillTool struct {
-	searchFn SkillSearchFunc
+	searchFn SkillSearchWithWhitelistFunc
+	listFn   SkillListFunc
 }
 
-func NewSearchSkill(searchFn SkillSearchFunc) *SearchSkillTool {
-	return &SearchSkillTool{searchFn: searchFn}
+func NewSearchSkill(searchFn SkillSearchWithWhitelistFunc, listFn SkillListFunc) *SearchSkillTool {
+	return &SearchSkillTool{searchFn: searchFn, listFn: listFn}
 }
 
 func (t *SearchSkillTool) Name() string { return "search_skill" }
 func (t *SearchSkillTool) Description() string {
-	return "Search for available skills to handle specific tasks like PDF, XLSX, DOCX processing."
+	base := "Search for available skills to handle specific tasks."
+	if t.listFn == nil {
+		return base
+	}
+
+	names := t.listFn()
+	if len(names) == 0 {
+		return base
+	}
+	return base + " Available skills: " + strings.Join(names, ", ") + "."
 }
 
 func (t *SearchSkillTool) InputSchema() map[string]any {
@@ -26,6 +38,13 @@ func (t *SearchSkillTool) InputSchema() map[string]any {
 			"query": map[string]any{
 				"type":        "string",
 				"description": "Search query describing the task",
+			},
+			"whitelist": map[string]any{
+				"type":        "array",
+				"description": "Optional skill name whitelist; when present only listed skills are visible.",
+				"items": map[string]any{
+					"type": "string",
+				},
 			},
 		},
 		"required": []string{"query"},
@@ -42,6 +61,18 @@ func (t *SearchSkillTool) Execute(_ context.Context, input map[string]any, _ *To
 		return &ToolResult{Content: "skill registry not available", IsError: true}, nil
 	}
 
-	result := t.searchFn(query)
+	var whitelist []string
+	if arr, ok := input["whitelist"].([]string); ok {
+		whitelist = append(whitelist, arr...)
+	}
+	if arr, ok := input["whitelist"].([]any); ok {
+		for _, item := range arr {
+			if s, ok := item.(string); ok && s != "" {
+				whitelist = append(whitelist, s)
+			}
+		}
+	}
+
+	result := t.searchFn(query, whitelist)
 	return &ToolResult{Content: result}, nil
 }

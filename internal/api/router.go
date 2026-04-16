@@ -21,6 +21,7 @@ type App struct {
 	FeedbackHandler *FeedbackHandler
 	UsageHandler    *UsageHandler
 	AdminHandler    *AdminHandler
+	AgentHandler    *AgentHandler
 	SkillHandler    *SkillHandler
 	TaskHandler     *TaskHandler
 	ChannelHandler  *ChannelHandler
@@ -105,6 +106,10 @@ func NewRouter(app *App) http.Handler {
 	// Skills
 	mux.HandleFunc("GET /api/skills", app.SkillHandler.List)
 	mux.HandleFunc("GET /api/skills/search", app.SkillHandler.Search)
+
+	// Agents
+	mux.HandleFunc("GET /api/agents", app.AgentHandler.List)
+	mux.HandleFunc("GET /api/agents/main", app.AgentHandler.GetMain)
 
 	// Tasks
 	mux.HandleFunc("GET /api/tasks", app.TaskHandler.List)

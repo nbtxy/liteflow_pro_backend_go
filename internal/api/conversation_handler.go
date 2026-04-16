@@ -294,6 +294,8 @@ type messageResponse struct {
 	ID             uuid.UUID       `json:"id"`
 	ConversationID uuid.UUID       `json:"conversationId"`
 	Role           string          `json:"role"`
+	SenderType     string          `json:"senderType,omitempty"`
+	AgentID        *string         `json:"agentId,omitempty"`
 	Content        string          `json:"content"`
 	TokenCount     *int32          `json:"tokenCount,omitempty"`
 	CreatedAt      string          `json:"createdAt"`
@@ -309,6 +311,8 @@ func flattenMessages(msgs []domain.Message) []messageResponse {
 			ID:             m.ID,
 			ConversationID: m.ConversationID,
 			Role:           m.Role,
+			SenderType:     m.SenderType,
+			AgentID:        m.AgentID,
 			Content:        m.Content,
 			TokenCount:     m.TokenCount,
 			CreatedAt:      m.CreatedAt.Format("2006-01-02T15:04:05.000Z"),

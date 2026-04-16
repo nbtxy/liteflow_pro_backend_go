@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -9,10 +8,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-type authMiddlewareDB interface {
-	QueryRow(ctx context.Context, sql string, args ...any) interface{ Scan(dest ...any) error }
-}
 
 func JWTAuthMiddleware(jwtSvc *JwtService, pool *pgxpool.Pool) func(http.Handler) http.Handler {
 	publicPrefixes := []string{
@@ -62,7 +57,8 @@ func JWTAuthMiddleware(jwtSvc *JwtService, pool *pgxpool.Pool) func(http.Handler
 			ctx := WithUserID(r.Context(), userID)
 
 			// Admin route protection
-			if strings.HasPrefix(path, "/api/admin/") {
+			requiresAgentAdmin := strings.HasPrefix(path, "/api/agents") && r.Method != http.MethodGet
+			if strings.HasPrefix(path, "/api/admin/") || requiresAgentAdmin {
 				var isAdmin bool
 				err := pool.QueryRow(ctx, "SELECT COALESCE(is_admin, false) FROM users WHERE id = $1", userID).Scan(&isAdmin)
 				if err != nil || !isAdmin {

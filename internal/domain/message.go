@@ -8,13 +8,17 @@ import (
 )
 
 type Message struct {
-	ID             uuid.UUID       `json:"id"`
-	ConversationID uuid.UUID       `json:"conversationId"`
-	Role           string          `json:"role"`    // system, user, assistant, tool
-	Content        string          `json:"content"`
-	TokenCount     *int32          `json:"tokenCount,omitempty"`
-	Metadata       json.RawMessage `json:"metadata,omitempty"` // JSONB: tool_calls, etc.
-	CreatedAt      time.Time       `json:"createdAt"`
+	ID              uuid.UUID       `json:"id"`
+	ConversationID  uuid.UUID       `json:"conversationId"`
+	Role            string          `json:"role"` // system, user, assistant, tool
+	SenderType      string          `json:"senderType,omitempty"`
+	AgentID         *string         `json:"agentId,omitempty"`
+	ParentMessageID *uuid.UUID      `json:"parentMessageId,omitempty"`
+	IsInternal      bool            `json:"isInternal,omitempty"`
+	Content         string          `json:"content"`
+	TokenCount      *int32          `json:"tokenCount,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty"` // JSONB: tool_calls, etc.
+	CreatedAt       time.Time       `json:"createdAt"`
 }
 
 // MessageMetadata represents the metadata stored in JSONB.
@@ -26,9 +30,9 @@ type MessageMetadata struct {
 }
 
 type ToolCallInfo struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
-	Function ToolCallFunc   `json:"function"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolCallFunc `json:"function"`
 }
 
 type ToolCallFunc struct {
