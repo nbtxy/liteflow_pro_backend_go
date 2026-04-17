@@ -93,6 +93,10 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 		defer resp.Body.Close()
 
 		scanner := bufio.NewScanner(resp.Body)
+		// OpenAI-compatible SSE lines may exceed Scanner's default 64KB token limit,
+		// especially when tool_call.arguments contains large payloads (e.g. create_file content).
+		// Increase max token size to avoid silent truncation.
+		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
 
@@ -101,6 +105,7 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 			}
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
+				slog.Debug("stream done")
 				break
 			}
 
@@ -115,6 +120,13 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 				case <-ctx.Done():
 					return
 				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			select {
+			case ch <- LlmChunk{Err: fmt.Errorf("read stream chunk: %w", err)}:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()

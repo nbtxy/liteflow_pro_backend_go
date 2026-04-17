@@ -265,6 +265,13 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 				if tc, ok := toolUseIndex[toolUseID]; ok {
 					tc["input"] = ev.Data["input"]
 				}
+			case agent.EventToolUseInputDelta:
+				toolUseID, _ := ev.Data["toolUseId"].(string)
+				inputDelta, _ := ev.Data["input_delta"].(string)
+				if tc, ok := toolUseIndex[toolUseID]; ok && inputDelta != "" {
+					prev, _ := tc["input"].(string)
+					tc["input"] = prev + inputDelta
+				}
 			case agent.EventToolResult:
 				toolUseID, _ := ev.Data["toolUseId"].(string)
 				status, _ := ev.Data["status"].(string)
@@ -828,6 +835,13 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 					toolUseID, _ := ev.Data["toolUseId"].(string)
 					if tc, ok := toolUseIndex[toolUseID]; ok {
 						tc["input"] = ev.Data["input"]
+					}
+				case agent.EventToolUseInputDelta:
+					toolUseID, _ := ev.Data["toolUseId"].(string)
+					inputDelta, _ := ev.Data["input_delta"].(string)
+					if tc, ok := toolUseIndex[toolUseID]; ok && inputDelta != "" {
+						prev, _ := tc["input"].(string)
+						tc["input"] = prev + inputDelta
 					}
 				case agent.EventToolResult:
 					toolUseID, _ := ev.Data["toolUseId"].(string)

@@ -48,9 +48,11 @@ func (a *AgentLoop) SetMcpExecutorBuilder(fn McpExecutorBuilder) {
 }
 
 type toolCallAccumulator struct {
-	id        string
-	name      string
-	arguments strings.Builder
+	id          string
+	name        string
+	arguments   strings.Builder
+	started     bool
+	emittedArgs int
 }
 
 func (a *AgentLoop) Execute(ctx context.Context, req *llm.LlmRequest,
@@ -245,6 +247,17 @@ func (a *AgentLoop) streamLLMResponse(ctx context.Context, req *llm.LlmRequest,
 			if chunk.ToolCallFunctionArgs != "" {
 				acc.arguments.WriteString(chunk.ToolCallFunctionArgs)
 			}
+			if !acc.started && acc.id != "" && acc.name != "" {
+				events <- ToolUseStartEvent(acc.id, acc.name)
+				acc.started = true
+			}
+			if acc.started {
+				args := acc.arguments.String()
+				if len(args) > acc.emittedArgs {
+					events <- ToolUseInputDeltaEvent(acc.id, args[acc.emittedArgs:])
+					acc.emittedArgs = len(args)
+				}
+			}
 		}
 
 		if chunk.Usage != nil {
@@ -256,9 +269,10 @@ func (a *AgentLoop) streamLLMResponse(ctx context.Context, req *llm.LlmRequest,
 }
 
 type toolCallInfo struct {
-	id        string
-	name      string
-	arguments string
+	id           string
+	name         string
+	arguments    string
+	startEmitted bool
 }
 
 func buildToolCalls(accs map[int]*toolCallAccumulator) []toolCallInfo {
@@ -269,9 +283,10 @@ func buildToolCalls(accs map[int]*toolCallAccumulator) []toolCallInfo {
 			continue
 		}
 		calls = append(calls, toolCallInfo{
-			id:        acc.id,
-			name:      acc.name,
-			arguments: acc.arguments.String(),
+			id:           acc.id,
+			name:         acc.name,
+			arguments:    acc.arguments.String(),
+			startEmitted: acc.started,
 		})
 	}
 	return calls
@@ -305,7 +320,9 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		argsParseErr = err
 	}
 
-	emit(ToolUseStartEvent(tc.id, tc.name))
+	if !tc.startEmitted {
+		emit(ToolUseStartEvent(tc.id, tc.name))
+	}
 	emit(ToolUseInputEvent(tc.id, input))
 
 	if tc.name == "search_skill" && opts != nil && opts.AgentRuntime != nil && opts.AgentRuntime.EnabledSkills != nil {
