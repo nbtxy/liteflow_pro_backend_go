@@ -210,150 +210,41 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 	var fullContent strings.Builder
 	var contentParts []map[string]any
-	toolUseIndex := make(map[string]map[string]any)
 
 	hasTools := rt != nil && len(rt.EnabledToolSet) > 0
-	var purpose string
+	purpose := "chat"
 	if hasTools {
 		purpose = "chat_with_tools"
-		currentMcpState := &conversation.MCPState{
+	}
+
+	provider := s.resolveRuntimeProvider(rt)
+	if provider == nil {
+		events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
+		return
+	}
+
+	currentMcpState := &conversation.MCPState{
+		Mode:           "inactive",
+		ActivatedTools: []string{},
+	}
+	if hasTools {
+		currentMcpState = &conversation.MCPState{
 			Mode:            mcpState.Mode,
 			ActivatedTools:  append([]string(nil), mcpState.ActivatedTools...),
 			SourceMessageID: mcpState.SourceMessageID,
 		}
-		toolCtx := &tool.ToolContext{
-			ConversationID: conv.ID,
-			MessageID:      assistantMsgID,
-			UserID:         userID,
-		}
-
-		var textAccum strings.Builder // accumulate text between tool calls
-
-		agentEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
-			MCPMode:                currentMcpState.Mode,
-			ActivatedTools:         currentMcpState.ActivatedTools,
-			ToolPool:               rt.EnabledToolSet,
-			AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
-			AgentRuntime:           rt,
-		})
-		for ev := range agentEvents {
-			switch ev.Type {
-			case agent.EventTextDelta:
-				if content, ok := ev.Data["content"].(string); ok {
-					fullContent.WriteString(content)
-					textAccum.WriteString(content)
-				}
-			case agent.EventToolUseStart:
-				// Flush accumulated text as a text part
-				if textAccum.Len() > 0 {
-					contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-					textAccum.Reset()
-				}
-				startedAt := time.Now().UnixMilli()
-				tc := map[string]any{
-					"toolUseId": ev.Data["toolUseId"],
-					"toolName":  ev.Data["toolName"],
-					"status":    "running",
-					"startedAt": startedAt,
-				}
-				if toolUseID, _ := ev.Data["toolUseId"].(string); toolUseID != "" {
-					toolUseIndex[toolUseID] = tc
-				}
-				contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
-			case agent.EventToolUseInput:
-				toolUseID, _ := ev.Data["toolUseId"].(string)
-				if tc, ok := toolUseIndex[toolUseID]; ok {
-					tc["input"] = ev.Data["input"]
-				}
-			case agent.EventToolUseInputDelta:
-				toolUseID, _ := ev.Data["toolUseId"].(string)
-				inputDelta, _ := ev.Data["input_delta"].(string)
-				if tc, ok := toolUseIndex[toolUseID]; ok && inputDelta != "" {
-					prev, _ := tc["input"].(string)
-					tc["input"] = prev + inputDelta
-				}
-			case agent.EventToolResult:
-				toolUseID, _ := ev.Data["toolUseId"].(string)
-				status, _ := ev.Data["status"].(string)
-				content, _ := ev.Data["content"].(string)
-				if mode, ok := ev.Data["mcp_mode"].(string); ok {
-					currentMcpState.Mode = mode
-					currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
-					if sourceMessageID := parseStringPointer(ev.Data["source_message_id"]); sourceMessageID != nil {
-						currentMcpState.SourceMessageID = sourceMessageID
-					} else if mode != "active" {
-						currentMcpState.SourceMessageID = nil
-					}
-				}
-				if tc, ok := toolUseIndex[toolUseID]; ok {
-					tc["status"] = status
-					if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
-						tc["duration"] = time.Now().UnixMilli() - startedAt
-					}
-				}
-				contentParts = append(contentParts, map[string]any{
-					"type":      "tool_result",
-					"toolUseId": toolUseID,
-					"status":    status,
-					"content":   content,
-				})
-			case agent.EventDelegationStart:
-				contentParts = append(contentParts, map[string]any{
-					"type":         "delegation_start",
-					"subAgentId":   ev.Data["subAgentId"],
-					"subAgentName": ev.Data["subAgentName"],
-					"task":         ev.Data["task"],
-				})
-			case agent.EventDelegationDelta:
-				contentParts = append(contentParts, map[string]any{
-					"type":         "delegation_delta",
-					"subAgentId":   ev.Data["subAgentId"],
-					"subAgentName": ev.Data["subAgentName"],
-					"content":      ev.Data["content"],
-				})
-			case agent.EventDelegationEnd:
-				contentParts = append(contentParts, map[string]any{
-					"type":         "delegation_end",
-					"subAgentId":   ev.Data["subAgentId"],
-					"subAgentName": ev.Data["subAgentName"],
-					"result":       ev.Data["result"],
-				})
-			}
-			events <- ev
-		}
-
-		// Flush remaining text
-		if textAccum.Len() > 0 {
-			contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-		}
+	}
+	toolCtx := &tool.ToolContext{
+		ConversationID: conv.ID,
+		MessageID:      assistantMsgID,
+		UserID:         userID,
+	}
+	runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
+	fullContent.WriteString(runResult.fullContent)
+	contentParts = runResult.contentParts
+	if hasTools {
 		if err := s.convSvc.SetMCPState(ctx, conv.ID, userID, currentMcpState); err != nil {
 			slog.Warn("failed to persist conversation MCP state", "conversationId", conv.ID, "err", err)
-		}
-	} else {
-		purpose = "chat"
-		provider := s.providerRouter.Default()
-		if rt != nil && rt.Provider != nil {
-			provider = rt.Provider
-		}
-		if provider == nil {
-			events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
-			return
-		}
-
-		chunks, err := provider.StreamChat(ctx, llmReq)
-		if err != nil {
-			events <- agent.ErrorEvent("stream_error", "流式调用失败: "+err.Error())
-			return
-		}
-
-		for chunk := range chunks {
-			if chunk.Content != "" {
-				fullContent.WriteString(chunk.Content)
-				events <- agent.TextDeltaEvent(chunk.Content)
-			}
-			if chunk.Usage != nil {
-				usageAcc.Add(chunk.Usage)
-			}
 		}
 	}
 
@@ -784,143 +675,40 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 
 		var fullContent strings.Builder
 		var contentParts []map[string]any
-		toolUseIndex := make(map[string]map[string]any)
 		hasTools := rt != nil && len(rt.EnabledToolSet) > 0
 		purpose := "chat"
-
 		if hasTools {
 			purpose = "chat_with_tools"
-			currentMcpState := &conversation.MCPState{
+		}
+
+		provider := s.resolveRuntimeProvider(rt)
+		if provider == nil {
+			events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
+			return
+		}
+
+		currentMcpState := &conversation.MCPState{
+			Mode:           "inactive",
+			ActivatedTools: []string{},
+		}
+		if hasTools {
+			currentMcpState = &conversation.MCPState{
 				Mode:            mcpState.Mode,
 				ActivatedTools:  append([]string(nil), mcpState.ActivatedTools...),
 				SourceMessageID: mcpState.SourceMessageID,
 			}
-			toolCtx := &tool.ToolContext{
-				ConversationID: convID,
-				MessageID:      newMsgID,
-				UserID:         userID,
-			}
-
-			var textAccum strings.Builder
-			for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
-				MCPMode:                currentMcpState.Mode,
-				ActivatedTools:         currentMcpState.ActivatedTools,
-				ToolPool:               rt.EnabledToolSet,
-				AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
-				AgentRuntime:           rt,
-			}) {
-				switch ev.Type {
-				case agent.EventTextDelta:
-					if c, ok := ev.Data["content"].(string); ok {
-						fullContent.WriteString(c)
-						textAccum.WriteString(c)
-					}
-				case agent.EventToolUseStart:
-					if textAccum.Len() > 0 {
-						contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-						textAccum.Reset()
-					}
-					startedAt := time.Now().UnixMilli()
-					tc := map[string]any{
-						"toolUseId": ev.Data["toolUseId"],
-						"toolName":  ev.Data["toolName"],
-						"status":    "running",
-						"startedAt": startedAt,
-					}
-					if toolUseID, _ := ev.Data["toolUseId"].(string); toolUseID != "" {
-						toolUseIndex[toolUseID] = tc
-					}
-					contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
-				case agent.EventToolUseInput:
-					toolUseID, _ := ev.Data["toolUseId"].(string)
-					if tc, ok := toolUseIndex[toolUseID]; ok {
-						tc["input"] = ev.Data["input"]
-					}
-				case agent.EventToolUseInputDelta:
-					toolUseID, _ := ev.Data["toolUseId"].(string)
-					inputDelta, _ := ev.Data["input_delta"].(string)
-					if tc, ok := toolUseIndex[toolUseID]; ok && inputDelta != "" {
-						prev, _ := tc["input"].(string)
-						tc["input"] = prev + inputDelta
-					}
-				case agent.EventToolResult:
-					toolUseID, _ := ev.Data["toolUseId"].(string)
-					status, _ := ev.Data["status"].(string)
-					content, _ := ev.Data["content"].(string)
-					if mode, ok := ev.Data["mcp_mode"].(string); ok {
-						currentMcpState.Mode = mode
-						currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
-						if sourceMessageID := parseStringPointer(ev.Data["source_message_id"]); sourceMessageID != nil {
-							currentMcpState.SourceMessageID = sourceMessageID
-						} else if mode != "active" {
-							currentMcpState.SourceMessageID = nil
-						}
-					}
-					if tc, ok := toolUseIndex[toolUseID]; ok {
-						tc["status"] = status
-						if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
-							tc["duration"] = time.Now().UnixMilli() - startedAt
-						}
-					}
-					contentParts = append(contentParts, map[string]any{
-						"type":      "tool_result",
-						"toolUseId": toolUseID,
-						"status":    status,
-						"content":   content,
-					})
-				case agent.EventDelegationStart:
-					contentParts = append(contentParts, map[string]any{
-						"type":         "delegation_start",
-						"subAgentId":   ev.Data["subAgentId"],
-						"subAgentName": ev.Data["subAgentName"],
-						"task":         ev.Data["task"],
-					})
-				case agent.EventDelegationDelta:
-					contentParts = append(contentParts, map[string]any{
-						"type":         "delegation_delta",
-						"subAgentId":   ev.Data["subAgentId"],
-						"subAgentName": ev.Data["subAgentName"],
-						"content":      ev.Data["content"],
-					})
-				case agent.EventDelegationEnd:
-					contentParts = append(contentParts, map[string]any{
-						"type":         "delegation_end",
-						"subAgentId":   ev.Data["subAgentId"],
-						"subAgentName": ev.Data["subAgentName"],
-						"result":       ev.Data["result"],
-					})
-				}
-				events <- ev
-			}
-
-			if textAccum.Len() > 0 {
-				contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
-			}
+		}
+		toolCtx := &tool.ToolContext{
+			ConversationID: convID,
+			MessageID:      newMsgID,
+			UserID:         userID,
+		}
+		runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
+		fullContent.WriteString(runResult.fullContent)
+		contentParts = runResult.contentParts
+		if hasTools {
 			if err := s.convSvc.SetMCPState(ctx, convID, userID, currentMcpState); err != nil {
 				slog.Warn("failed to persist conversation MCP state for regenerate", "conversationId", convID, "err", err)
-			}
-		} else {
-			provider := s.providerRouter.Default()
-			if rt != nil && rt.Provider != nil {
-				provider = rt.Provider
-			}
-			if provider == nil {
-				events <- agent.ErrorEvent("no_provider", "没有可用的LLM提供者")
-				return
-			}
-			chunks, err := provider.StreamChat(ctx, llmReq)
-			if err != nil {
-				events <- agent.ErrorEvent("stream_error", err.Error())
-				return
-			}
-			for chunk := range chunks {
-				if chunk.Content != "" {
-					fullContent.WriteString(chunk.Content)
-					events <- agent.TextDeltaEvent(chunk.Content)
-				}
-				if chunk.Usage != nil {
-					usageAcc.Add(chunk.Usage)
-				}
 			}
 		}
 
@@ -967,6 +755,142 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 	}()
 
 	return events
+}
+
+type agentStreamRunResult struct {
+	fullContent  string
+	contentParts []map[string]any
+}
+
+func (s *Service) resolveRuntimeProvider(rt *agent_profile.AgentRuntime) llm.Provider {
+	provider := s.providerRouter.Default()
+	if rt != nil && rt.Provider != nil {
+		provider = rt.Provider
+	}
+	return provider
+}
+
+func (s *Service) resolveRuntimeToolExecution(rt *agent_profile.AgentRuntime) (map[string]tool.Tool, []string) {
+	if rt == nil {
+		return nil, nil
+	}
+	return rt.EnabledToolSet, rt.EnabledMcpChannelNames
+}
+
+func (s *Service) streamAgentEvents(
+	ctx context.Context,
+	llmReq *llm.LlmRequest,
+	toolCtx *tool.ToolContext,
+	usageAcc *llm.LlmUsage,
+	rt *agent_profile.AgentRuntime,
+	currentMcpState *conversation.MCPState,
+	events chan<- agent.Event,
+) agentStreamRunResult {
+	toolPool, allowedMcpChannelNames := s.resolveRuntimeToolExecution(rt)
+	toolUseIndex := make(map[string]map[string]any)
+	var fullContent strings.Builder
+	var textAccum strings.Builder
+	contentParts := make([]map[string]any, 0, 16)
+
+	for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
+		MCPMode:                currentMcpState.Mode,
+		ActivatedTools:         currentMcpState.ActivatedTools,
+		ToolPool:               toolPool,
+		AllowedMcpChannelNames: allowedMcpChannelNames,
+		AgentRuntime:           rt,
+	}) {
+		switch ev.Type {
+		case agent.EventTextDelta:
+			if content, ok := ev.Data["content"].(string); ok {
+				fullContent.WriteString(content)
+				textAccum.WriteString(content)
+			}
+		case agent.EventToolUseStart:
+			if textAccum.Len() > 0 {
+				contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+				textAccum.Reset()
+			}
+			startedAt := time.Now().UnixMilli()
+			tc := map[string]any{
+				"toolUseId": ev.Data["toolUseId"],
+				"toolName":  ev.Data["toolName"],
+				"status":    "running",
+				"startedAt": startedAt,
+			}
+			if toolUseID, _ := ev.Data["toolUseId"].(string); toolUseID != "" {
+				toolUseIndex[toolUseID] = tc
+			}
+			contentParts = append(contentParts, map[string]any{"type": "tool_use", "toolCall": tc})
+		case agent.EventToolUseInput:
+			toolUseID, _ := ev.Data["toolUseId"].(string)
+			if tc, ok := toolUseIndex[toolUseID]; ok {
+				tc["input"] = ev.Data["input"]
+			}
+		case agent.EventToolUseInputDelta:
+			toolUseID, _ := ev.Data["toolUseId"].(string)
+			inputDelta, _ := ev.Data["input_delta"].(string)
+			if tc, ok := toolUseIndex[toolUseID]; ok && inputDelta != "" {
+				prev, _ := tc["input"].(string)
+				tc["input"] = prev + inputDelta
+			}
+		case agent.EventToolResult:
+			toolUseID, _ := ev.Data["toolUseId"].(string)
+			status, _ := ev.Data["status"].(string)
+			content, _ := ev.Data["content"].(string)
+			if mode, ok := ev.Data["mcp_mode"].(string); ok {
+				currentMcpState.Mode = mode
+				currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
+				if sourceMessageID := parseStringPointer(ev.Data["source_message_id"]); sourceMessageID != nil {
+					currentMcpState.SourceMessageID = sourceMessageID
+				} else if mode != "active" {
+					currentMcpState.SourceMessageID = nil
+				}
+			}
+			if tc, ok := toolUseIndex[toolUseID]; ok {
+				tc["status"] = status
+				if startedAt, ok := tc["startedAt"].(int64); ok && startedAt > 0 {
+					tc["duration"] = time.Now().UnixMilli() - startedAt
+				}
+			}
+			contentParts = append(contentParts, map[string]any{
+				"type":      "tool_result",
+				"toolUseId": toolUseID,
+				"status":    status,
+				"content":   content,
+			})
+		case agent.EventDelegationStart:
+			contentParts = append(contentParts, map[string]any{
+				"type":         "delegation_start",
+				"subAgentId":   ev.Data["subAgentId"],
+				"subAgentName": ev.Data["subAgentName"],
+				"task":         ev.Data["task"],
+			})
+		case agent.EventDelegationDelta:
+			contentParts = append(contentParts, map[string]any{
+				"type":         "delegation_delta",
+				"subAgentId":   ev.Data["subAgentId"],
+				"subAgentName": ev.Data["subAgentName"],
+				"content":      ev.Data["content"],
+			})
+		case agent.EventDelegationEnd:
+			contentParts = append(contentParts, map[string]any{
+				"type":         "delegation_end",
+				"subAgentId":   ev.Data["subAgentId"],
+				"subAgentName": ev.Data["subAgentName"],
+				"result":       ev.Data["result"],
+			})
+		}
+		events <- ev
+	}
+
+	if textAccum.Len() > 0 {
+		contentParts = append(contentParts, map[string]any{"type": "text", "text": textAccum.String()})
+	}
+
+	return agentStreamRunResult{
+		fullContent:  fullContent.String(),
+		contentParts: contentParts,
+	}
 }
 
 func normalizeContentParts(parts []map[string]any) []map[string]any {
