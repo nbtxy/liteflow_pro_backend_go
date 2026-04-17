@@ -165,7 +165,6 @@ func main() {
 	// Tool Registry
 	toolRegistry := tool.NewRegistry()
 	toolRegistry.Register(tool.NewCalculator())
-	toolRegistry.Register(tool.NewCurrentTime())
 	toolRegistry.Register(tool.NewWebSearch(searchRouter))
 	toolRegistry.Register(tool.NewActiveMCP(mcpSvc.ActivateByPlatform))
 	toolRegistry.Register(tool.NewMemoryManage(memorySvc.ManageTool))
