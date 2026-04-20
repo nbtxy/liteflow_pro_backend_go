@@ -202,3 +202,63 @@ func (s *Service) CreateFileArtifact(ctx context.Context, conversationID, messag
 		}(),
 	}, nil
 }
+
+func (s *Service) CreateImageArtifact(ctx context.Context, conversationID, messageID uuid.UUID,
+	path string, data []byte, mimeType string) (map[string]any, error) {
+
+	var existingID uuid.UUID
+	var existingVersion int32
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, version FROM artifacts
+		 WHERE conversation_id = $1 AND file_path = $2 AND (file_deleted IS NULL OR file_deleted = FALSE)
+		 ORDER BY version DESC LIMIT 1`, conversationID, path).Scan(&existingID, &existingVersion)
+
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+	metaBytes, _ := json.Marshal(map[string]any{
+		"source":    "generated",
+		"mime_type": mimeType,
+	})
+
+	newArtifact := &domain.Artifact{
+		ID:             uuid.New(),
+		ConversationID: conversationID,
+		MessageID:      &messageID,
+		FilePath:       path,
+		Type:           string(domain.ArtifactTypeImage),
+		Version:        1,
+		Metadata:       json.RawMessage(metaBytes),
+		CreatedAt:      time.Now(),
+	}
+
+	fileSize := int64(len(data))
+	newArtifact.FileSize = &fileSize
+	title := path
+	newArtifact.Title = &title
+
+	if err == nil {
+		newArtifact.Version = existingVersion + 1
+		newArtifact.ParentID = &existingID
+	}
+
+	if err := s.Create(ctx, newArtifact); err != nil {
+		slog.Error("failed to create image artifact", "err", err)
+		return nil, err
+	}
+
+	return map[string]any{
+		"artifact_id": newArtifact.ID.String(),
+		"type":        newArtifact.Type,
+		"title":       path,
+		"version":     newArtifact.Version,
+		"file_size":   fileSize,
+		"mime_type":   mimeType,
+		"parent_id": func() string {
+			if newArtifact.ParentID != nil {
+				return newArtifact.ParentID.String()
+			}
+			return ""
+		}(),
+	}, nil
+}

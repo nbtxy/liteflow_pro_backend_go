@@ -12,6 +12,8 @@ import (
 
 type CreateFileArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path, content string) (map[string]any, error)
 
+type CreateImageArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path string, data []byte, mimeType string) (map[string]any, error)
+
 type CreateFileTool struct {
 	storageSvc      storage.Service
 	createArtifact  CreateFileArtifactFunc

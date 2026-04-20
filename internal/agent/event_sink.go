@@ -1,21 +1,17 @@
 package agent
 
-import "context"
+import (
+	"context"
 
-type eventSinkKey struct{}
+	"github.com/liteflow/backend/internal/platform/events"
+)
 
-type EventSink func(Event)
+type EventSink = events.Sink
 
 func WithEventSink(ctx context.Context, sink EventSink) context.Context {
-	if sink == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, eventSinkKey{}, sink)
+	return events.WithSink(ctx, sink)
 }
 
 func EmitFromContext(ctx context.Context, event Event) {
-	sink, _ := ctx.Value(eventSinkKey{}).(EventSink)
-	if sink != nil {
-		sink(event)
-	}
+	events.Emit(ctx, event)
 }

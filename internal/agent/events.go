@@ -1,6 +1,10 @@
 package agent
 
-type EventType string
+import "github.com/liteflow/backend/internal/platform/events"
+
+type EventType = events.EventType
+
+type Event = events.Event
 
 const (
 	EventStreamStart       EventType = "stream_start"
@@ -18,17 +22,8 @@ const (
 	EventError             EventType = "error"
 )
 
-type Event struct {
-	Type EventType      `json:"type"`
-	Data map[string]any `json:"data,omitempty"`
-}
-
 func NewEvent(typ EventType, data map[string]any) Event {
-	if data == nil {
-		data = make(map[string]any)
-	}
-	data["type"] = string(typ)
-	return Event{Type: typ, Data: data}
+	return events.NewEvent(typ, data)
 }
 
 func TextDeltaEvent(content string) Event {
