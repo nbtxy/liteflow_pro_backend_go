@@ -1,6 +1,10 @@
 package llm
 
-import "github.com/liteflow/backend/internal/config"
+import (
+	"strings"
+
+	"github.com/liteflow/backend/internal/config"
+)
 
 func NewCloudflareProvider(cfg config.CloudflareConfig) *BaseOpenAIProvider {
 	model := cfg.Model
@@ -15,10 +19,22 @@ func NewCloudflareProvider(cfg config.CloudflareConfig) *BaseOpenAIProvider {
 
 	return NewBaseOpenAIProvider(BaseOpenAIConfig{
 		Name:      "cloudflare-ai-gateway",
-		Endpoint:  cfg.Endpoint,
+		Endpoint:  normalizeCloudflareChatEndpoint(cfg.Endpoint),
 		Model:     model,
 		MaxTokens: 8000,
 		Vision:    true,
 		Headers:   headers,
 	})
+}
+
+func normalizeCloudflareChatEndpoint(endpoint string) string {
+	const chatSuffix = "/compat/chat/completions"
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if endpoint == "" {
+		return endpoint
+	}
+	if strings.HasSuffix(endpoint, chatSuffix) {
+		return endpoint
+	}
+	return endpoint + chatSuffix
 }

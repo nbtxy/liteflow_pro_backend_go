@@ -184,6 +184,32 @@ func main() {
 	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
 	toolRegistry.Register(tool.NewDownloadFile(storageSvc, artifactSvc.CreateFileArtifact))
+	if cfg.LLM.Cloudflare.Endpoint != "" && cfg.LLM.Cloudflare.Token != "" {
+		toolRegistry.Register(tool.NewImageGenerate(
+			storageSvc,
+			ossLinkSvc,
+			artifactSvc.CreateImageArtifact,
+			func(ctx context.Context, userID, conversationID, messageID uuid.UUID, tokenUsage *llm.LlmUsage) {
+				if usageSvc == nil || tokenUsage == nil || tokenUsage.TotalTokens() <= 0 {
+					return
+				}
+				usageSvc.RecordAsync(
+					ctx,
+					userID,
+					conversationID,
+					messageID,
+					"Nano Banana2",
+					tokenUsage,
+					"tool_generate_or_edit_image",
+					"tool",
+					0,
+				)
+			},
+			cfg.LLM.Cloudflare,
+		))
+	} else {
+		slog.Info("generate_or_edit_image tool disabled (missing CF_AI_GATEWAY_ENDPOINT / CF_AIG_TOKEN)")
+	}
 	agentRegistry, err := agent_profile.LoadFromDir("./config/agents")
 	if err != nil {
 		slog.Error("failed to load agent yaml config", "err", err)

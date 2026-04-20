@@ -86,7 +86,7 @@ type CloudflareConfig struct {
 	Endpoint   string `env:"CF_AI_GATEWAY_ENDPOINT"`
 	Model      string `env:"CF_AI_GATEWAY_MODEL" envDefault:"@cf/meta/llama-3.1-8b-instruct"`
 	Token      string `env:"CF_AIG_TOKEN"`
-	ImageModel string `env:"CF_AI_GATEWAY_IMAGE_MODEL" envDefault:"gemini-3-pro-image-preview"`
+	ImageModel string `env:"CF_AI_GATEWAY_IMAGE_MODEL" envDefault:"gemini-3.1-flash-image-preview"`
 }
 
 type MCPConfig struct {
