@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	MaxIterations = 20
-	ToolTimeout   = 30 * time.Second
-	MaxToolResult = 200000
+	MaxIterations           = 20
+	ToolTimeout             = 30 * time.Second
+	AnalyzeImageToolTimeout = 120 * time.Second
+	MaxToolResult           = 200000
 )
 
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error)
@@ -354,7 +355,7 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 			IsError: true,
 		}
 	} else {
-		execCtx, cancel := context.WithTimeout(ctx, ToolTimeout)
+		execCtx, cancel := context.WithTimeout(ctx, toolTimeout(tc.name))
 		defer cancel()
 		execCtx = WithEventSink(execCtx, emit)
 
@@ -491,4 +492,13 @@ func parseStringSlice(v any) []string {
 		}
 	}
 	return result
+}
+
+func toolTimeout(toolName string) time.Duration {
+	switch toolName {
+	case "analyze_image":
+		return AnalyzeImageToolTimeout
+	default:
+		return ToolTimeout
+	}
 }

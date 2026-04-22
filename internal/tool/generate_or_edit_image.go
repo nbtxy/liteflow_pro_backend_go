@@ -1,21 +1,16 @@
 package tool
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/liteflow/backend/internal/config"
+	"github.com/liteflow/backend/internal/imagegen"
 	"github.com/liteflow/backend/internal/llm"
 	"github.com/liteflow/backend/internal/platform/events"
 	"github.com/liteflow/backend/internal/platform/storage"
@@ -24,14 +19,13 @@ import (
 type RecordToolUsageFunc func(ctx context.Context, userID, conversationID, messageID uuid.UUID, usage *llm.LlmUsage)
 
 type ImageGenerateTool struct {
-	storageSvc     storage.Service
-	ossLinkSvc     storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
-	createArtifact CreateImageArtifactFunc
-	recordUsage    RecordToolUsageFunc
-	httpClient     *http.Client
-	cfEndpoint     string
-	cfToken        string
-	model          string
+	storageSvc      storage.Service
+	ossLinkSvc      storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
+	createArtifact  CreateImageArtifactFunc
+	recordUsage     RecordToolUsageFunc
+	providerRouter  *imagegen.ProviderRouter
+	defaultProvider string
+	defaultModel    string
 }
 
 func NewImageGenerate(
@@ -39,21 +33,20 @@ func NewImageGenerate(
 	ossLinkSvc storage.Service,
 	createArtifact CreateImageArtifactFunc,
 	recordUsage RecordToolUsageFunc,
-	cfg config.CloudflareConfig,
+	providerRouter *imagegen.ProviderRouter,
+	defaultProvider string,
+	defaultModel string,
 ) *ImageGenerateTool {
-	model := strings.TrimSpace(cfg.ImageModel)
-	if model == "" {
-		model = "gemini-3.1-flash-image-preview"
-	}
+	defaultProvider = strings.TrimSpace(defaultProvider)
+	defaultModel = strings.TrimSpace(defaultModel)
 	return &ImageGenerateTool{
-		storageSvc:     storageSvc,
-		ossLinkSvc:     ossLinkSvc,
-		createArtifact: createArtifact,
-		recordUsage:    recordUsage,
-		httpClient:     &http.Client{},
-		cfEndpoint:     normalizeCloudflareGatewayBase(cfg.Endpoint),
-		cfToken:        strings.TrimSpace(cfg.Token),
-		model:          model,
+		storageSvc:      storageSvc,
+		ossLinkSvc:      ossLinkSvc,
+		createArtifact:  createArtifact,
+		recordUsage:     recordUsage,
+		providerRouter:  providerRouter,
+		defaultProvider: defaultProvider,
+		defaultModel:    defaultModel,
 	}
 }
 
@@ -75,6 +68,25 @@ func (t *ImageGenerateTool) InputSchema() map[string]any {
 				"type":        "string",
 				"enum":        []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
 				"description": "可选宽高比，默认由模型决定（编辑原图时一般不传，避免改变构图）",
+			},
+			"image_count": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     4,
+				"description": "可选生成图片数量（1-4），默认由模型或网关决定",
+			},
+			"resolution": map[string]any{
+				"type":        "string",
+				"enum":        []string{"512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"},
+				"description": "可选输出分辨率（宽x高）",
+			},
+			"provider": map[string]any{
+				"type":        "string",
+				"description": "可选图片生成 provider 名称，不传则使用默认 provider",
+			},
+			"model": map[string]any{
+				"type":        "string",
+				"description": "可选图片生成模型名，不传则使用默认模型",
 			},
 			"reference_image_paths": map[string]any{
 				"type":        "array",
@@ -115,153 +127,94 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 	if prompt == "" {
 		return &ToolResult{Content: "prompt is required", IsError: true}, nil
 	}
-	if t.cfEndpoint == "" || t.cfToken == "" {
-		return &ToolResult{Content: "image generation not configured", IsError: true}, nil
+	if t.providerRouter == nil {
+		return &ToolResult{Content: "image generation provider router not configured", IsError: true}, nil
 	}
 
 	aspectRatio, _ := input["aspect_ratio"].(string)
+	aspectRatio = strings.TrimSpace(aspectRatio)
+
+	imageCount, hasImageCount, err := parseImageCount(input["image_count"])
+	if err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+
+	resolution, hasResolution, err := parseResolution(input["resolution"])
+	if err != nil {
+		return &ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+
+	selectedProviderName := t.defaultProvider
+	if v, ok := input["provider"].(string); ok && strings.TrimSpace(v) != "" {
+		selectedProviderName = strings.TrimSpace(v)
+	}
+	selectedModel := t.defaultModel
+	if v, ok := input["model"].(string); ok && strings.TrimSpace(v) != "" {
+		selectedModel = strings.TrimSpace(v)
+	}
+
+	selectedProvider := t.providerRouter.Default()
+	if selectedProviderName != "" {
+		p, getErr := t.providerRouter.Get(selectedProviderName)
+		if getErr != nil {
+			return &ToolResult{Content: getErr.Error(), IsError: true}, nil
+		}
+		selectedProvider = p
+	}
+	if selectedProvider == nil {
+		return &ToolResult{Content: "no image generation provider available", IsError: true}, nil
+	}
 
 	t.emitNarration(ctx, "已接收图像任务，开始准备输入...")
-	parts := []geminiPart{{Text: prompt}}
+	referenceImages := make([]imagegen.InputImage, 0, 4)
 	if refs, ok := input["reference_image_paths"]; ok {
 		for _, filePath := range toStringSlice(refs) {
 			if filePath == "" {
 				continue
 			}
-			refPart, err := t.fetchReferencePartFromPath(ctx, tc.ConversationID.String(), filePath)
+			ref, err := t.fetchReferenceImageByPath(ctx, tc.ConversationID.String(), filePath)
 			if err != nil {
 				slog.Warn("reference image fetch by path failed", "path", filePath, "err", err)
 				continue
 			}
-			parts = append(parts, refPart)
+			referenceImages = append(referenceImages, ref)
 		}
 	}
 	t.emitNarration(ctx, "参考图已就绪，正在请求模型生成...")
-	genConfig := map[string]any{
-		"responseModalities": []string{"IMAGE", "TEXT"},
-	}
-	if aspectRatio != "" {
-		genConfig["imageConfig"] = map[string]any{"aspectRatio": aspectRatio}
-	}
 
-	body, err := json.Marshal(map[string]any{
-		"contents": []map[string]any{
-			{
-				"role":  "user",
-				"parts": parts,
-			},
-		},
-		"generationConfig": genConfig,
+	providerReq := &imagegen.Request{
+		Prompt:          prompt,
+		AspectRatio:     aspectRatio,
+		Model:           selectedModel,
+		ReferenceImages: referenceImages,
+	}
+	if hasImageCount {
+		providerReq.ImageCount = imageCount
+	}
+	if hasResolution {
+		providerReq.Resolution = resolution
+	}
+	resp, err := selectedProvider.Generate(ctx, providerReq, func(delta string) {
+		events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
+			"content": delta,
+			"source":  "tool:generate_or_edit_image",
+		}))
 	})
-	if err != nil {
-		return &ToolResult{Content: fmt.Sprintf("marshal request failed: %v", err), IsError: true}, nil
-	}
-
-	url := fmt.Sprintf("%s/google-ai-studio/v1beta/models/%s:streamGenerateContent?alt=sse", t.cfEndpoint, t.model)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return &ToolResult{Content: fmt.Sprintf("build request failed: %v", err), IsError: true}, nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("cf-aig-authorization", "Bearer "+t.cfToken)
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := t.httpClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return &ToolResult{Content: "image generation cancelled", IsError: true}, nil
 		}
-		return &ToolResult{Content: fmt.Sprintf("request failed: %v", err), IsError: true}, nil
+		return &ToolResult{Content: fmt.Sprintf("image generation failed: %v", err), IsError: true}, nil
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-		return &ToolResult{
-			Content: fmt.Sprintf("image gateway error: %d %s", resp.StatusCode, strings.TrimSpace(string(respBody))),
-			IsError: true,
-		}, nil
-	}
-
-	var imageB64 strings.Builder
-	mimeType := "image/png"
-	usageAcc := &llm.LlmUsage{}
-	reader := bufio.NewReader(resp.Body)
-	emittedFirstChunk := false
-	streamStart := time.Now()
-	chunkCount := 0
-	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimRight(line, "\r\n")
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if payload == "" || payload == "[DONE]" {
-					if readErr != nil {
-						break
-					}
-					continue
-				}
-				var chunk geminiChunk
-				if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-					slog.Warn("gemini chunk parse failed", "err", err, "payload", truncateForLog(payload, 200))
-				} else {
-					if chunk.UsageMetadata != nil {
-						if chunk.UsageMetadata.PromptTokenCount > usageAcc.InputTokens {
-							usageAcc.InputTokens = chunk.UsageMetadata.PromptTokenCount
-						}
-						if chunk.UsageMetadata.CandidatesTokenCount > usageAcc.OutputTokens {
-							usageAcc.OutputTokens = chunk.UsageMetadata.CandidatesTokenCount
-						}
-					}
-					chunkCount++
-					slog.Info("gemini chunk",
-						"idx", chunkCount,
-						"ms_since_stream_start", time.Since(streamStart).Milliseconds(),
-						"payload_bytes", len(payload),
-					)
-					if !emittedFirstChunk {
-						emittedFirstChunk = true
-						t.emitNarration(ctx, "模型已开始返回流式结果...")
-					}
-					for _, cand := range chunk.Candidates {
-						for _, part := range cand.Content.Parts {
-							if part.Text != "" {
-								events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
-									"content": part.Text,
-									"source":  "tool:generate_or_edit_image",
-								}))
-							}
-							if part.InlineData != nil && part.InlineData.Data != "" {
-								imageB64.WriteString(part.InlineData.Data)
-								if part.InlineData.MimeType != "" {
-									mimeType = part.InlineData.MimeType
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
-				return &ToolResult{Content: "image generation cancelled", IsError: true}, nil
-			}
-			return &ToolResult{Content: fmt.Sprintf("stream read failed: %v", readErr), IsError: true}, nil
-		}
-	}
-
-	if imageB64.Len() == 0 {
+	if resp == nil || len(resp.ImageBytes) == 0 {
 		return &ToolResult{Content: "no image data returned", IsError: true}, nil
 	}
 
-	imageBytes, err := base64.StdEncoding.DecodeString(imageB64.String())
-	if err != nil {
-		return &ToolResult{Content: fmt.Sprintf("decode image failed: %v", err), IsError: true}, nil
+	mimeType := resp.MimeType
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = "image/png"
 	}
+	imageBytes := resp.ImageBytes
 
 	filename := fmt.Sprintf("generated_%d%s", time.Now().UnixNano(), extFromMime(mimeType))
 	if err := t.storageSvc.UploadFile(ctx, tc.ConversationID.String(), filename, imageBytes); err != nil {
@@ -272,7 +225,7 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 	if err != nil {
 		return &ToolResult{Content: fmt.Sprintf("create artifact failed: %v", err), IsError: true}, nil
 	}
-	t.recordToolUsage(ctx, tc, usageAcc)
+	t.recordToolUsage(ctx, tc, resp.Usage)
 
 	const presignExpireMinutes = 60
 	signedURL, signErr, usedOSS := t.presignedURLForGeneratedImage(ctx, tc.ConversationID.String(), filename, imageBytes, presignExpireMinutes)
@@ -281,6 +234,8 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 		slog.Warn("generate presigned url failed", "path", filename, "usedOSS", usedOSS, "err", signErr)
 	} else {
 		expiresAt := time.Now().Add(presignExpireMinutes * time.Minute)
+		metadata["provider"] = selectedProvider.Name()
+		metadata["model"] = selectedModel
 		metadata["oss_url"] = signedURL
 		metadata["oss_url_expires_at"] = expiresAt.Format(time.RFC3339)
 		metadata["oss_url_expires_in_minutes"] = presignExpireMinutes
@@ -379,28 +334,66 @@ func toStringSlice(v any) []string {
 	}
 }
 
-func (t *ImageGenerateTool) fetchReferencePartFromPath(ctx context.Context, conversationID, filePath string) (geminiPart, error) {
+func parseImageCount(v any) (int, bool, error) {
+	if v == nil {
+		return 0, false, nil
+	}
+
+	var count int
+	switch vv := v.(type) {
+	case int:
+		count = vv
+	case int32:
+		count = int(vv)
+	case int64:
+		count = int(vv)
+	case float64:
+		// JSON number is usually float64.
+		if vv != float64(int(vv)) {
+			return 0, false, fmt.Errorf("image_count must be an integer")
+		}
+		count = int(vv)
+	default:
+		return 0, false, fmt.Errorf("image_count must be an integer")
+	}
+
+	if count < 1 || count > 4 {
+		return 0, false, fmt.Errorf("image_count must be between 1 and 4")
+	}
+	return count, true, nil
+}
+
+func parseResolution(v any) (string, bool, error) {
+	if v == nil {
+		return "", false, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false, fmt.Errorf("resolution must be a string")
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false, nil
+	}
+	switch s {
+	case "512x512", "768x768", "1024x1024", "1024x1536", "1536x1024":
+		return s, true, nil
+	default:
+		return "", false, fmt.Errorf("resolution must be one of: 512x512, 768x768, 1024x1024, 1024x1536, 1536x1024")
+	}
+}
+
+func (t *ImageGenerateTool) fetchReferenceImageByPath(ctx context.Context, conversationID, filePath string) (imagegen.InputImage, error) {
 	data, err := t.storageSvc.ReadFile(ctx, conversationID, filePath)
 	if err != nil {
-		return geminiPart{}, fmt.Errorf("read file by path: %w", err)
+		return imagegen.InputImage{}, fmt.Errorf("read file by path: %w", err)
 	}
 	mime := http.DetectContentType(data)
 	if !strings.HasPrefix(mime, "image/") {
-		return geminiPart{}, fmt.Errorf("not an image: %s", mime)
+		return imagegen.InputImage{}, fmt.Errorf("not an image: %s", mime)
 	}
-	return geminiPart{
-		InlineData: &geminiInlineIn{
-			MimeType: mime,
-			Data:     base64.StdEncoding.EncodeToString(data),
-		},
+	return imagegen.InputImage{
+		MimeType: mime,
+		Data:     data,
 	}, nil
-}
-
-func normalizeCloudflareGatewayBase(endpoint string) string {
-	const chatSuffix = "/compat/chat/completions"
-	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	if endpoint == "" {
-		return endpoint
-	}
-	return strings.TrimSuffix(endpoint, chatSuffix)
 }

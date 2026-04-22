@@ -24,6 +24,7 @@ import (
 	"github.com/liteflow/backend/internal/config"
 	"github.com/liteflow/backend/internal/conversation"
 	"github.com/liteflow/backend/internal/feedback"
+	"github.com/liteflow/backend/internal/imagegen"
 	"github.com/liteflow/backend/internal/llm"
 	"github.com/liteflow/backend/internal/maintenance"
 	"github.com/liteflow/backend/internal/mcp"
@@ -100,6 +101,12 @@ func main() {
 	}
 	if cfg.LLM.Cloudflare.Endpoint != "" {
 		providerRouter.Register(llm.NewCloudflareProvider(cfg.LLM.Cloudflare))
+	}
+
+	// Image Generation Providers
+	imageProviderRouter := imagegen.NewProviderRouter("cloudflare-gemini-image")
+	if cfg.LLM.Cloudflare.Endpoint != "" && cfg.LLM.Cloudflare.Token != "" {
+		imageProviderRouter.Register(imagegen.NewCloudflareGeminiProvider(cfg.LLM.Cloudflare))
 	}
 
 	// Services
@@ -184,7 +191,12 @@ func main() {
 	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
 	toolRegistry.Register(tool.NewDownloadFile(storageSvc, artifactSvc.CreateFileArtifact))
-	if cfg.LLM.Cloudflare.Endpoint != "" && cfg.LLM.Cloudflare.Token != "" {
+	if _, err := providerRouter.Get("qwen"); err == nil {
+		toolRegistry.Register(tool.NewAnalyzeImage(storageSvc, ossLinkSvc, providerRouter))
+	} else {
+		slog.Info("analyze_image tool disabled (qwen provider unavailable)")
+	}
+	if len(imageProviderRouter.Available()) > 0 {
 		toolRegistry.Register(tool.NewImageGenerate(
 			storageSvc,
 			ossLinkSvc,
@@ -205,10 +217,12 @@ func main() {
 					0,
 				)
 			},
-			cfg.LLM.Cloudflare,
+			imageProviderRouter,
+			"cloudflare-gemini-image",
+			cfg.LLM.Cloudflare.ImageModel,
 		))
 	} else {
-		slog.Info("generate_or_edit_image tool disabled (missing CF_AI_GATEWAY_ENDPOINT / CF_AIG_TOKEN)")
+		slog.Info("generate_or_edit_image tool disabled (no image generation provider available)")
 	}
 	agentRegistry, err := agent_profile.LoadFromDir("./config/agents")
 	if err != nil {
