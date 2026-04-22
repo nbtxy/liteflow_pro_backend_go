@@ -135,21 +135,23 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		Role:           "user",
 		SenderType:     "user",
 		AgentID:        resolvedAgentID,
-		Content:        req.Message,
 		CreatedAt:      time.Now(),
+	}
+	if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": req.Message}}); err == nil {
+		userMsg.ContentParts = parts
 	}
 	tokenCount := int32(len(req.Message))
 	userMsg.TokenCount = &tokenCount
 
-	if len(req.Attachments) > 0 || len(req.QuotedMessage) > 0 {
-		meta := map[string]any{}
-		if len(req.Attachments) > 0 {
-			meta["attachments"] = req.Attachments
-		}
-		if len(req.QuotedMessage) > 0 {
-			meta["quotedMessage"] = req.QuotedMessage
-		}
-		if metaBytes, err := json.Marshal(meta); err == nil {
+	userMeta := map[string]any{}
+	if len(req.Attachments) > 0 {
+		userMeta["attachments"] = req.Attachments
+	}
+	if len(req.QuotedMessage) > 0 {
+		userMeta["quotedMessage"] = req.QuotedMessage
+	}
+	if len(userMeta) > 0 {
+		if metaBytes, err := json.Marshal(userMeta); err == nil {
 			userMsg.Metadata = metaBytes
 		}
 	}
@@ -192,7 +194,6 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		Role:           "assistant",
 		SenderType:     "agent",
 		AgentID:        resolvedAgentID,
-		Content:        "",
 		CreatedAt:      time.Now(),
 	}
 	if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
@@ -208,7 +209,6 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		"conversationId": conv.ID.String(),
 	})
 
-	var fullContent strings.Builder
 	var contentParts []map[string]any
 
 	hasTools := rt != nil && len(rt.EnabledToolSet) > 0
@@ -240,7 +240,6 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		UserID:         userID,
 	}
 	runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
-	fullContent.WriteString(runResult.fullContent)
 	contentParts = runResult.contentParts
 	if hasTools {
 		if err := s.convSvc.SetMCPState(ctx, conv.ID, userID, currentMcpState); err != nil {
@@ -250,9 +249,10 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 
 	var metadata json.RawMessage
 	metaMap := map[string]any{}
+	applyStreamErrorFallback(&contentParts, runResult, metaMap)
 	normalizedParts := normalizeContentParts(contentParts)
-	if len(normalizedParts) > 0 {
-		metaMap["contentParts"] = normalizedParts
+	if parts, err := json.Marshal(normalizedParts); err == nil {
+		assistantMsg.ContentParts = parts
 	}
 	if len(metaMap) > 0 {
 		if metaBytes, err := json.Marshal(metaMap); err == nil {
@@ -260,9 +260,8 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		}
 	}
 
-	assistantMsg.Content = fullContent.String()
 	assistantMsg.Metadata = metadata
-	tc := int32(len(assistantMsg.Content))
+	tc := int32(len(extractTextFromContentParts(normalizedParts)))
 	assistantMsg.TokenCount = &tc
 
 	if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
@@ -337,10 +336,12 @@ func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, tas
 		Role:            "user",
 		SenderType:      "agent",
 		AgentID:         subAgentRef,
-		Content:         prompt.String(),
 		CreatedAt:       time.Now(),
 		ParentMessageID: parentMessageID,
 		IsInternal:      true,
+	}
+	if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": prompt.String()}}); err == nil {
+		inputMsg.ContentParts = parts
 	}
 	if parentTC != nil && parentTC.ConversationID != uuid.Nil {
 		inputMsg.ConversationID = parentTC.ConversationID
@@ -414,10 +415,12 @@ func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, tas
 			Role:            "assistant",
 			SenderType:      "agent",
 			AgentID:         subAgentRef,
-			Content:         result,
 			CreatedAt:       time.Now(),
 			ParentMessageID: parentMessageID,
 			IsInternal:      true,
+		}
+		if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": result}}); err == nil {
+			internalResult.ContentParts = parts
 		}
 		_ = s.convSvc.SaveMessage(ctx, internalResult)
 	}
@@ -657,7 +660,6 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			Role:           "assistant",
 			SenderType:     "agent",
 			AgentID:        resolvedAgentID,
-			Content:        "",
 			CreatedAt:      time.Now(),
 		}
 		if err := s.convSvc.SaveMessage(ctx, assistantMsg); err != nil {
@@ -673,7 +675,6 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			"conversationId": convID.String(),
 		})
 
-		var fullContent strings.Builder
 		var contentParts []map[string]any
 		hasTools := rt != nil && len(rt.EnabledToolSet) > 0
 		purpose := "chat"
@@ -704,7 +705,6 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			UserID:         userID,
 		}
 		runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
-		fullContent.WriteString(runResult.fullContent)
 		contentParts = runResult.contentParts
 		if hasTools {
 			if err := s.convSvc.SetMCPState(ctx, convID, userID, currentMcpState); err != nil {
@@ -712,16 +712,15 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 		}
 
-		assistantMsg.Content = fullContent.String()
-		tc := int32(len(assistantMsg.Content))
-		assistantMsg.TokenCount = &tc
-
 		// Build metadata
 		metaMap := map[string]any{}
+		applyStreamErrorFallback(&contentParts, runResult, metaMap)
 		normalizedParts := normalizeContentParts(contentParts)
-		if len(normalizedParts) > 0 {
-			metaMap["contentParts"] = normalizedParts
+		if parts, err := json.Marshal(normalizedParts); err == nil {
+			assistantMsg.ContentParts = parts
 		}
+		tc := int32(len(extractTextFromContentParts(normalizedParts)))
+		assistantMsg.TokenCount = &tc
 		if len(metaMap) > 0 {
 			if metaBytes, err := json.Marshal(metaMap); err == nil {
 				assistantMsg.Metadata = metaBytes
@@ -758,8 +757,9 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 }
 
 type agentStreamRunResult struct {
-	fullContent  string
 	contentParts []map[string]any
+	errorCode    string
+	errorMessage string
 }
 
 func (s *Service) resolveRuntimeProvider(rt *agent_profile.AgentRuntime) llm.Provider {
@@ -788,9 +788,10 @@ func (s *Service) streamAgentEvents(
 ) agentStreamRunResult {
 	toolPool, allowedMcpChannelNames := s.resolveRuntimeToolExecution(rt)
 	toolUseIndex := make(map[string]map[string]any)
-	var fullContent strings.Builder
 	var textAccum strings.Builder
 	contentParts := make([]map[string]any, 0, 16)
+	var streamErrorCode string
+	var streamErrorMessage string
 
 	for ev := range s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
 		MCPMode:                currentMcpState.Mode,
@@ -802,7 +803,6 @@ func (s *Service) streamAgentEvents(
 		switch ev.Type {
 		case agent.EventTextDelta:
 			if content, ok := ev.Data["content"].(string); ok {
-				fullContent.WriteString(content)
 				textAccum.WriteString(content)
 			}
 		case agent.EventToolUseStart:
@@ -879,6 +879,13 @@ func (s *Service) streamAgentEvents(
 				"subAgentName": ev.Data["subAgentName"],
 				"result":       ev.Data["result"],
 			})
+		case agent.EventError:
+			if code, ok := ev.Data["code"].(string); ok {
+				streamErrorCode = code
+			}
+			if msg, ok := ev.Data["message"].(string); ok {
+				streamErrorMessage = msg
+			}
 		}
 		events <- ev
 	}
@@ -888,9 +895,52 @@ func (s *Service) streamAgentEvents(
 	}
 
 	return agentStreamRunResult{
-		fullContent:  fullContent.String(),
 		contentParts: contentParts,
+		errorCode:    streamErrorCode,
+		errorMessage: streamErrorMessage,
 	}
+}
+
+func applyStreamErrorFallback(
+	contentParts *[]map[string]any,
+	runResult agentStreamRunResult,
+	metaMap map[string]any,
+) {
+	if runResult.errorMessage == "" {
+		return
+	}
+
+	warning := "⚠️ " + runResult.errorMessage
+	current := extractTextFromContentParts(*contentParts)
+
+	*contentParts = append(*contentParts, map[string]any{
+		"type": "text",
+		"text": func() string {
+			if strings.TrimSpace(current) == "" {
+				return warning
+			}
+			return "\n\n" + warning
+		}(),
+	})
+
+	metaMap["error"] = map[string]any{
+		"code":    runResult.errorCode,
+		"message": runResult.errorMessage,
+	}
+}
+
+func extractTextFromContentParts(parts []map[string]any) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		if mapString(part, "type") != "text" {
+			continue
+		}
+		b.WriteString(mapString(part, "text"))
+	}
+	return b.String()
 }
 
 func normalizeContentParts(parts []map[string]any) []map[string]any {

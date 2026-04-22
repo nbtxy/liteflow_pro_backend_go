@@ -26,23 +26,29 @@ func NewOutputSender(pool *pgxpool.Pool, feishuSender FeishuSender) *DefaultOutp
 }
 
 func (s *DefaultOutputSender) SendToConversation(ctx context.Context, userID, convID uuid.UUID, taskName, content string) error {
+	text := fmt.Sprintf("**[定时任务: %s]**\n\n%s", taskName, content)
 	msg := &domain.Message{
 		ID:             uuid.New(),
 		ConversationID: convID,
 		Role:           "assistant",
-		Content:        fmt.Sprintf("**[定时任务: %s]**\n\n%s", taskName, content),
 		CreatedAt:      time.Now(),
+	}
+	if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": text}}); err == nil {
+		msg.ContentParts = parts
 	}
 	tc := int32(len(content))
 	msg.TokenCount = &tc
 
-	meta, _ := json.Marshal(map[string]any{"source": "scheduled_task", "taskName": taskName})
+	meta, _ := json.Marshal(map[string]any{
+		"source":   "scheduled_task",
+		"taskName": taskName,
+	})
 	msg.Metadata = meta
 
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO messages (id, conversation_id, role, content, token_count, metadata, created_at)
+		`INSERT INTO messages (id, conversation_id, role, content_parts, token_count, metadata, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		msg.ID, msg.ConversationID, msg.Role, msg.Content, msg.TokenCount, msg.Metadata, msg.CreatedAt)
+		msg.ID, msg.ConversationID, msg.Role, msg.ContentParts, msg.TokenCount, msg.Metadata, msg.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("save task result message: %w", err)
 	}

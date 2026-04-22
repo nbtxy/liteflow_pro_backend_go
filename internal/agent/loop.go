@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -18,6 +19,7 @@ const (
 	MaxIterations           = 20
 	ToolTimeout             = 30 * time.Second
 	AnalyzeImageToolTimeout = 120 * time.Second
+	LLMIterationTimeout     = 180 * time.Second
 	MaxToolResult           = 200000
 )
 
@@ -218,7 +220,10 @@ func (a *AgentLoop) streamLLMResponse(ctx context.Context, req *llm.LlmRequest,
 		return nil, "", nil
 	}
 
-	chunks, err := provider.StreamChat(ctx, req)
+	llmCtx, cancel := context.WithTimeout(ctx, LLMIterationTimeout)
+	defer cancel()
+
+	chunks, err := provider.StreamChat(llmCtx, req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -268,6 +273,13 @@ func (a *AgentLoop) streamLLMResponse(ctx context.Context, req *llm.LlmRequest,
 		if chunk.Usage != nil {
 			usageAcc.Add(chunk.Usage)
 		}
+	}
+
+	if err := llmCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, content.String(), fmt.Errorf("LLM 响应超时（>%s）", LLMIterationTimeout.String())
+		}
+		return nil, content.String(), err
 	}
 
 	return accumulators, content.String(), nil

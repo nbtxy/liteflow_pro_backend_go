@@ -258,7 +258,7 @@ func (s *Service) cleanupConversationFilesOnStorage(
 
 func (s *Service) GetMessages(ctx context.Context, conversationID uuid.UUID) ([]domain.Message, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content, token_count, metadata, created_at
+		`SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content_parts, token_count, metadata, created_at
 		 FROM messages
 		 WHERE conversation_id = $1
 		   AND (is_internal IS NULL OR is_internal = FALSE)
@@ -271,8 +271,8 @@ func (s *Service) GetMessages(ctx context.Context, conversationID uuid.UUID) ([]
 	var msgs []domain.Message
 	for rows.Next() {
 		var m domain.Message
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal, &m.Content,
-			&m.TokenCount, &m.Metadata, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal,
+			&m.ContentParts, &m.TokenCount, &m.Metadata, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
@@ -294,12 +294,15 @@ func (s *Service) SaveMessage(ctx context.Context, msg *domain.Message) error {
 			msg.SenderType = "agent"
 		}
 	}
+	if len(msg.ContentParts) == 0 {
+		msg.ContentParts = json.RawMessage("[]")
+	}
 
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO messages (id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content, token_count, metadata, created_at)
+		`INSERT INTO messages (id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content_parts, token_count, metadata, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		 ON CONFLICT (id) DO UPDATE SET sender_type = $4, agent_id = $5, parent_message_id = $6, is_internal = $7, content = $8, token_count = $9, metadata = $10`,
-		msg.ID, msg.ConversationID, msg.Role, msg.SenderType, msg.AgentID, msg.ParentMessageID, msg.IsInternal, msg.Content, msg.TokenCount, msg.Metadata, msg.CreatedAt)
+		 ON CONFLICT (id) DO UPDATE SET sender_type = $4, agent_id = $5, parent_message_id = $6, is_internal = $7, content_parts = $8, token_count = $9, metadata = $10`,
+		msg.ID, msg.ConversationID, msg.Role, msg.SenderType, msg.AgentID, msg.ParentMessageID, msg.IsInternal, msg.ContentParts, msg.TokenCount, msg.Metadata, msg.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("save message: %w", err)
 	}
@@ -397,9 +400,9 @@ func (s *Service) listDeletableFilePathsByMessageTx(ctx context.Context, tx pgx.
 func (s *Service) GetMessageByID(ctx context.Context, messageID uuid.UUID) (*domain.Message, error) {
 	var m domain.Message
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content, token_count, metadata, created_at
+		`SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content_parts, token_count, metadata, created_at
 		 FROM messages WHERE id = $1`, messageID).Scan(
-		&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal, &m.Content, &m.TokenCount, &m.Metadata, &m.CreatedAt)
+		&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal, &m.ContentParts, &m.TokenCount, &m.Metadata, &m.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -412,7 +415,7 @@ func (s *Service) GetMessageByID(ctx context.Context, messageID uuid.UUID) (*dom
 func (s *Service) GetLastAgentMessage(ctx context.Context, conversationID uuid.UUID) (*domain.Message, error) {
 	var m domain.Message
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content, token_count, metadata, created_at
+		SELECT id, conversation_id, role, sender_type, agent_id, parent_message_id, is_internal, content_parts, token_count, metadata, created_at
 		FROM messages
 		WHERE conversation_id = $1
 		  AND role = 'assistant'
@@ -420,7 +423,7 @@ func (s *Service) GetLastAgentMessage(ctx context.Context, conversationID uuid.U
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, conversationID).Scan(
-		&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal, &m.Content, &m.TokenCount, &m.Metadata, &m.CreatedAt,
+		&m.ID, &m.ConversationID, &m.Role, &m.SenderType, &m.AgentID, &m.ParentMessageID, &m.IsInternal, &m.ContentParts, &m.TokenCount, &m.Metadata, &m.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

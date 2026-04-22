@@ -129,7 +129,7 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 		currentTokens := 0
 		for i := len(history) - 1; i >= 0; i-- {
 			msg := history[i]
-			msgTokens := estimateTokens(msg.Content)
+			msgTokens := estimateTokens(extractMessageText(msg))
 			if msg.TokenCount != nil {
 				msgTokens = int(*msg.TokenCount)
 			}
@@ -203,26 +203,24 @@ func buildLlmMessages(
 		if err := json.Unmarshal(msg.Metadata, &meta); err == nil {
 			return []LlmMessage{{
 				Role:       "tool",
-				Content:    msg.Content,
+				Content:    extractMessageText(msg),
 				ToolCallID: meta.ToolCallID,
 				Name:       meta.ToolName,
 			}}
 		}
 	}
 
-	if msg.Role == "assistant" && msg.Metadata != nil {
-		var assistantMeta struct {
-			ContentParts []assistantContentPart `json:"contentParts"`
-		}
-		if err := json.Unmarshal(msg.Metadata, &assistantMeta); err == nil {
-			if len(assistantMeta.ContentParts) > 0 {
-				intermediate := buildIntermediateMessagesFromContentParts(assistantMeta.ContentParts)
-				if len(intermediate) > 0 {
-					result := make([]LlmMessage, 0, len(intermediate)+1)
-					result = append(result, intermediate...)
-					result = append(result, LlmMessage{Role: "assistant", Content: msg.Content})
-					return result
+	if msg.Role == "assistant" && len(msg.ContentParts) > 0 {
+		var parts []assistantContentPart
+		if err := json.Unmarshal(msg.ContentParts, &parts); err == nil && len(parts) > 0 {
+			intermediate := buildIntermediateMessagesFromContentParts(parts)
+			if len(intermediate) > 0 {
+				result := make([]LlmMessage, 0, len(intermediate)+1)
+				result = append(result, intermediate...)
+				if assistantText := extractMessageText(msg); assistantText != "" {
+					result = append(result, LlmMessage{Role: "assistant", Content: assistantText})
 				}
+				return result
 			}
 		}
 	}
@@ -241,7 +239,8 @@ func buildLlmMessages(
 			} `json:"attachments"`
 		}
 		if err := json.Unmarshal(msg.Metadata, &meta); err == nil {
-			content := msg.Content
+			baseText := extractMessageText(msg)
+			content := baseText
 			if meta.QuotedMessage != nil {
 				quotedRole := "用户"
 				if meta.QuotedMessage.Role == "assistant" {
@@ -293,18 +292,21 @@ func buildLlmMessages(
 					combinedContent += strings.Join(textParts, "\n")
 				}
 
-				if len(images) > 0 || combinedContent != msg.Content {
+				if len(images) > 0 || combinedContent != baseText {
 					return []LlmMessage{{Role: "user", Content: combinedContent, Images: images}}
 				}
 			}
 
-			if content != msg.Content {
+			if content != baseText {
 				return []LlmMessage{{Role: "user", Content: content}}
 			}
 		}
 	}
 
-	return []LlmMessage{{Role: msg.Role, Content: msg.Content}}
+	if msg.Role == "user" {
+		return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
+	}
+	return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
 }
 
 type assistantContentPart struct {
@@ -318,6 +320,26 @@ type assistantContentPart struct {
 		ToolName  string `json:"toolName"`
 		Input     any    `json:"input,omitempty"`
 	} `json:"toolCall,omitempty"`
+}
+
+func extractMessageText(msg domain.Message) string {
+	if len(msg.ContentParts) == 0 {
+		return ""
+	}
+	var parts []assistantContentPart
+	if err := json.Unmarshal(msg.ContentParts, &parts); err != nil {
+		return ""
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		if part.Type == "text" {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
 }
 
 func buildIntermediateMessagesFromContentParts(parts []assistantContentPart) []LlmMessage {

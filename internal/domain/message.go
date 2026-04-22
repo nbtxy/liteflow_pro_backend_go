@@ -15,7 +15,7 @@ type Message struct {
 	AgentID         *string         `json:"agentId,omitempty"`
 	ParentMessageID *uuid.UUID      `json:"parentMessageId,omitempty"`
 	IsInternal      bool            `json:"isInternal,omitempty"`
-	Content         string          `json:"content"`
+	ContentParts    json.RawMessage `json:"contentParts,omitempty"`
 	TokenCount      *int32          `json:"tokenCount,omitempty"`
 	Metadata        json.RawMessage `json:"metadata,omitempty"` // JSONB: tool_calls, etc.
 	CreatedAt       time.Time       `json:"createdAt"`

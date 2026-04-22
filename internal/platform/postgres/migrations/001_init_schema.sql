@@ -72,7 +72,7 @@ CREATE TABLE messages (
     agent_id            VARCHAR(64),
     parent_message_id   UUID REFERENCES messages(id) ON DELETE SET NULL,
     is_internal         BOOLEAN NOT NULL DEFAULT FALSE,
-    content             TEXT NOT NULL,
+    content_parts       JSONB NOT NULL DEFAULT '[]'::jsonb,
     token_count         INTEGER,
     metadata            JSONB DEFAULT '{}',
     created_at          TIMESTAMPTZ DEFAULT now()
