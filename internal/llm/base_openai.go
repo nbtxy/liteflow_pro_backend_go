@@ -183,6 +183,12 @@ func (p *BaseOpenAIProvider) buildRequestBody(req *LlmRequest, stream bool) map[
 
 	messages := make([]map[string]any, 0, len(req.Messages))
 	for _, msg := range req.Messages {
+		// Skip empty assistant stubs (no content, no tool_calls) to avoid
+		// sending invalid/no-op turns like {"role":"assistant"} to providers.
+		if msg.Role == "assistant" && strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
+			continue
+		}
+
 		m := map[string]any{
 			"role": msg.Role,
 		}

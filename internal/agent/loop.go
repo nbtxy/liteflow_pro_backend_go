@@ -115,6 +115,10 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		}
 
 		if len(accumulators) == 0 {
+			if strings.TrimSpace(iterContent) == "" {
+				slog.Warn("agent loop ended with empty response", "iteration", iteration)
+				events <- ErrorEvent("empty_response", "模型未返回内容，请重试")
+			}
 			return
 		}
 
