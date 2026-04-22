@@ -17,14 +17,16 @@ import (
 )
 
 type Service struct {
-	pool       *pgxpool.Pool
-	storageSvc storage.Service
+	pool           *pgxpool.Pool
+	storageSvc     storage.Service
+	ossLinkStorage storage.Service
 }
 
-func NewService(pool *pgxpool.Pool, storageSvc storage.Service) *Service {
+func NewService(pool *pgxpool.Pool, storageSvc storage.Service, ossLinkStorage storage.Service) *Service {
 	return &Service{
-		pool:       pool,
-		storageSvc: storageSvc,
+		pool:           pool,
+		storageSvc:     storageSvc,
+		ossLinkStorage: ossLinkStorage,
 	}
 }
 
@@ -165,7 +167,7 @@ func (s *Service) Delete(ctx context.Context, id, userID uuid.UUID) error {
 	defer tx.Rollback(ctx)
 
 	var filePaths []string
-	if s.storageSvc != nil {
+	if s.storageSvc != nil || s.ossLinkStorage != nil {
 		filePaths, err = s.listConversationFilePathsTx(ctx, tx, id)
 		if err != nil {
 			return fmt.Errorf("list conversation files: %w", err)
@@ -214,11 +216,23 @@ func (s *Service) listConversationFilePathsTx(ctx context.Context, tx pgx.Tx, co
 }
 
 func (s *Service) cleanupConversationFiles(ctx context.Context, conversationID uuid.UUID, filePaths []string) {
-	if s.storageSvc == nil {
+	s.cleanupConversationFilesOnStorage(ctx, conversationID, filePaths, s.storageSvc)
+	if s.ossLinkStorage != nil && s.ossLinkStorage != s.storageSvc {
+		s.cleanupConversationFilesOnStorage(ctx, conversationID, filePaths, s.ossLinkStorage)
+	}
+}
+
+func (s *Service) cleanupConversationFilesOnStorage(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	filePaths []string,
+	target storage.Service,
+) {
+	if target == nil {
 		return
 	}
 
-	if cleaner, ok := s.storageSvc.(interface {
+	if cleaner, ok := target.(interface {
 		DeleteConversation(context.Context, string) error
 	}); ok {
 		if err := cleaner.DeleteConversation(ctx, conversationID.String()); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -233,7 +247,7 @@ func (s *Service) cleanupConversationFiles(ctx context.Context, conversationID u
 		if path == "" {
 			continue
 		}
-		if err := s.storageSvc.DeleteFile(ctx, conversationID.String(), path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := target.DeleteFile(ctx, conversationID.String(), path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			slog.Warn("failed to delete conversation file",
 				"conversationId", conversationID.String(),
 				"path", path,

@@ -61,7 +61,9 @@ func NewRouter(app *App) http.Handler {
 
 	// Conversation files (loaded from artifacts)
 	mux.HandleFunc("GET /api/conversations/{id}/files", app.ArtifactHandler.ListFiles)
-	mux.HandleFunc("POST /api/conversations/{id}/files", app.ArtifactHandler.UploadFile)
+	mux.HandleFunc("POST /api/conversations/{id}/files/sts", app.ArtifactHandler.GetUploadSTS)
+	mux.HandleFunc("POST /api/conversations/{id}/files", app.ArtifactHandler.CompleteUpload)
+	mux.HandleFunc("POST /api/conversations/{id}/files/complete", app.ArtifactHandler.CompleteUpload)
 	mux.HandleFunc("GET /api/conversations/{id}/files/download", app.ArtifactHandler.DownloadFile)
 	mux.HandleFunc("DELETE /api/conversations/{id}/files/delete", app.ArtifactHandler.DeleteFile)
 

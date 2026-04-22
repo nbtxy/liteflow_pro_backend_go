@@ -63,6 +63,57 @@ func (s *OSSService) DeleteFile(_ context.Context, conversationID, path string) 
 	return nil
 }
 
+func (s *OSSService) DeleteConversation(_ context.Context, conversationID string) error {
+	prefix := fmt.Sprintf("conversations/%s/", conversationID)
+	marker := ""
+
+	for {
+		opts := []oss.Option{
+			oss.Prefix(prefix),
+			oss.MaxKeys(1000),
+		}
+		if marker != "" {
+			opts = append(opts, oss.Marker(marker))
+		}
+
+		result, err := s.bucket.ListObjects(opts...)
+		if err != nil {
+			return fmt.Errorf("list objects by prefix %s: %w", prefix, err)
+		}
+
+		if len(result.Objects) == 0 {
+			if !result.IsTruncated {
+				return nil
+			}
+			if result.NextMarker == "" {
+				return nil
+			}
+			marker = result.NextMarker
+			continue
+		}
+
+		keys := make([]string, 0, len(result.Objects))
+		for _, obj := range result.Objects {
+			if obj.Key != "" {
+				keys = append(keys, obj.Key)
+			}
+		}
+		if len(keys) > 0 {
+			if _, err := s.bucket.DeleteObjects(keys, oss.DeleteObjectsQuiet(true)); err != nil {
+				return fmt.Errorf("delete objects by prefix %s: %w", prefix, err)
+			}
+		}
+
+		if !result.IsTruncated {
+			return nil
+		}
+		marker = result.NextMarker
+		if marker == "" {
+			return nil
+		}
+	}
+}
+
 func (s *OSSService) GeneratePresignedURL(
 	_ context.Context,
 	conversationID,

@@ -110,8 +110,39 @@ func main() {
 	}
 
 	// Services
-	storageSvc := storage.NewLocal(cfg.Storage.BasePath)
-	convSvc := conversation.NewService(pool, storageSvc)
+	if cfg.Storage.AliyunEndpoint == "" ||
+		cfg.Storage.AliyunRegion == "" ||
+		cfg.Storage.AliyunBucket == "" ||
+		cfg.Storage.AliyunKeyID == "" ||
+		cfg.Storage.AliyunSecret == "" {
+		slog.Error("OSS storage config is required (endpoint/region/bucket/key)")
+		os.Exit(1)
+	}
+	storageSvc, err := storage.NewOSS(
+		cfg.Storage.AliyunEndpoint,
+		cfg.Storage.AliyunBucket,
+		cfg.Storage.AliyunKeyID,
+		cfg.Storage.AliyunSecret,
+	)
+	if err != nil {
+		slog.Error("failed to initialize OSS storage", "err", err)
+		os.Exit(1)
+	}
+	localCacheStorage := storage.NewLocal(cfg.Storage.BasePath)
+	stsProvider, err := storage.NewSTSProvider(
+		cfg.Storage.AliyunRegion,
+		cfg.Storage.AliyunEndpoint,
+		cfg.Storage.AliyunBucket,
+		cfg.Storage.AliyunKeyID,
+		cfg.Storage.AliyunSecret,
+		cfg.Storage.AliyunStsRole,
+		cfg.Storage.AliyunStsTTL,
+	)
+	if err != nil {
+		slog.Error("failed to initialize OSS STS provider", "err", err)
+		os.Exit(1)
+	}
+	var convSvc *conversation.Service
 	usageSvc := usage.NewService(pool)
 	artifactSvc := artifact.NewService(pool)
 	searchRouter := platformsearch.NewProviderRouter(cfg.Search.Provider)
@@ -131,24 +162,8 @@ func main() {
 			cfg.Search.Tavily.Count,
 		))
 	}
-	var ossLinkSvc storage.Service
-	if cfg.Storage.AliyunEndpoint != "" &&
-		cfg.Storage.AliyunBucket != "" &&
-		cfg.Storage.AliyunKeyID != "" &&
-		cfg.Storage.AliyunSecret != "" {
-		ossSvc, err := storage.NewOSS(
-			cfg.Storage.AliyunEndpoint,
-			cfg.Storage.AliyunBucket,
-			cfg.Storage.AliyunKeyID,
-			cfg.Storage.AliyunSecret,
-		)
-		if err != nil {
-			slog.Error("failed to initialize OSS link storage", "err", err)
-			os.Exit(1)
-		}
-		ossLinkSvc = ossSvc
-		slog.Info("OSS link storage enabled for LLM attachments")
-	}
+	ossLinkSvc := storageSvc
+	convSvc = conversation.NewService(pool, storageSvc, ossLinkSvc)
 	memorySvc := memory.NewService(pool)
 	feedbackSvc := feedback.NewService(pool)
 	userSvc := user.NewService(pool)
@@ -187,7 +202,7 @@ func main() {
 	}))
 	toolRegistry.Register(tool.NewManageScheduledTask(taskScheduler.ManageTool))
 	toolRegistry.Register(tool.NewCreateFile(storageSvc, artifactSvc.CreateFileArtifact))
-	toolRegistry.Register(tool.NewStrReplace(storageSvc, artifactSvc.CreateFileArtifact))
+	toolRegistry.Register(tool.NewStrReplace(storageSvc, localCacheStorage, artifactSvc.CreateFileArtifact))
 	toolRegistry.Register(tool.NewView(storageSvc, artifactSvc.GetLatestArtifacts))
 	toolRegistry.Register(tool.NewHttpRequest())
 	toolRegistry.Register(tool.NewDownloadFile(storageSvc, artifactSvc.CreateFileArtifact))
@@ -291,7 +306,7 @@ func main() {
 		AuthHandler:     api.NewAuthHandler(authSvc),
 		ChatHandler:     api.NewChatHandler(chatSvc),
 		ConvHandler:     api.NewConversationHandler(convSvc),
-		ArtifactHandler: api.NewArtifactHandler(artifactSvc, storageSvc),
+		ArtifactHandler: api.NewArtifactHandler(artifactSvc, storageSvc, stsProvider),
 		MemoryHandler:   api.NewMemoryHandler(memorySvc),
 		UserHandler:     api.NewUserHandler(userSvc),
 		FeedbackHandler: api.NewFeedbackHandler(feedbackSvc),

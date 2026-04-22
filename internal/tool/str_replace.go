@@ -10,15 +10,18 @@ import (
 
 type StrReplaceTool struct {
 	storageSvc     storage.Service
+	cacheStorage   storage.Service
 	createArtifact CreateFileArtifactFunc
 }
 
-func NewStrReplace(storageSvc storage.Service, createArtifact CreateFileArtifactFunc) *StrReplaceTool {
-	return &StrReplaceTool{storageSvc: storageSvc, createArtifact: createArtifact}
+func NewStrReplace(storageSvc storage.Service, cacheStorage storage.Service, createArtifact CreateFileArtifactFunc) *StrReplaceTool {
+	return &StrReplaceTool{storageSvc: storageSvc, cacheStorage: cacheStorage, createArtifact: createArtifact}
 }
 
-func (t *StrReplaceTool) Name() string        { return "str_replace" }
-func (t *StrReplaceTool) Description() string  { return "编辑对话中已有文件，通过查找替换修改指定内容" }
+func (t *StrReplaceTool) Name() string { return "str_replace" }
+func (t *StrReplaceTool) Description() string {
+	return "编辑对话中已有文件，通过查找替换修改指定内容"
+}
 func (t *StrReplaceTool) InputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -59,7 +62,15 @@ func (t *StrReplaceTool) Execute(ctx context.Context, input map[string]any, tc *
 
 	data, err := t.storageSvc.ReadFile(ctx, convID, path)
 	if err != nil {
-		return &ToolResult{Content: fmt.Sprintf("读取文件失败: %v", err), IsError: true}, nil
+		if t.cacheStorage != nil {
+			cacheData, cacheErr := t.cacheStorage.ReadFile(ctx, convID, path)
+			if cacheErr != nil {
+				return &ToolResult{Content: fmt.Sprintf("读取文件失败: %v", err), IsError: true}, nil
+			}
+			data = cacheData
+		} else {
+			return &ToolResult{Content: fmt.Sprintf("读取文件失败: %v", err), IsError: true}, nil
+		}
 	}
 
 	current := string(data)
@@ -71,6 +82,11 @@ func (t *StrReplaceTool) Execute(ctx context.Context, input map[string]any, tc *
 
 	if err := t.storageSvc.UploadFile(ctx, convID, path, []byte(updated)); err != nil {
 		return &ToolResult{Content: fmt.Sprintf("写入文件失败: %v", err), IsError: true}, nil
+	}
+	if t.cacheStorage != nil {
+		if err := t.cacheStorage.UploadFile(ctx, convID, path, []byte(updated)); err != nil {
+			return &ToolResult{Content: fmt.Sprintf("写入缓存文件失败: %v", err), IsError: true}, nil
+		}
 	}
 
 	metadata, err := t.createArtifact(ctx, tc.ConversationID, tc.MessageID, path, updated)

@@ -246,12 +246,13 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 		if usedOSS {
 			linkLabel = "OSS 临时链接"
 		}
+		downloadLink := fmt.Sprintf("[%s](%s)", filename, signedURL)
 		content = fmt.Sprintf(
 			"图像已生成: %s (%d bytes)\n%s: %s\n链接有效期: %d 分钟（有效期至 %s）",
 			filename,
 			len(imageBytes),
 			linkLabel,
-			signedURL,
+			downloadLink,
 			presignExpireMinutes,
 			expiresAt.Local().Format("2006-01-02 15:04:05 MST"),
 		)

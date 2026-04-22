@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,10 +21,15 @@ import (
 type ArtifactHandler struct {
 	artifactSvc *artifact.Service
 	storageSvc  storage.Service
+	stsProvider *storage.STSProvider
 }
 
-func NewArtifactHandler(artifactSvc *artifact.Service, storageSvc storage.Service) *ArtifactHandler {
-	return &ArtifactHandler{artifactSvc: artifactSvc, storageSvc: storageSvc}
+const maxUploadBaseNameLen = 80
+
+var uploadNameSanitizeRegex = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+func NewArtifactHandler(artifactSvc *artifact.Service, storageSvc storage.Service, stsProvider *storage.STSProvider) *ArtifactHandler {
+	return &ArtifactHandler{artifactSvc: artifactSvc, storageSvc: storageSvc, stsProvider: stsProvider}
 }
 
 func (h *ArtifactHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +94,65 @@ func (h *ArtifactHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ArtifactHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
+	h.CompleteUpload(w, r)
+}
+
+func (h *ArtifactHandler) GetUploadSTS(w http.ResponseWriter, r *http.Request) {
+	_, err := auth.GetUserID(r.Context())
+	if err != nil {
+		Unauthorized(w, "unauthorized")
+		return
+	}
+	if h.stsProvider == nil {
+		InternalError(w, "STS provider is not configured")
+		return
+	}
+
+	convID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		BadRequest(w, "invalid conversation id")
+		return
+	}
+	var req struct {
+		FileName string `json:"fileName"`
+		Path     string `json:"path"`
+	}
+	if err := DecodeJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	baseName, err := normalizeUploadFileName(req.FileName)
+	if err != nil {
+		BadRequest(w, "invalid file name")
+		return
+	}
+	path, err := normalizeOrGenerateUploadPath(req.Path, baseName)
+	if err != nil {
+		BadRequest(w, "invalid upload path")
+		return
+	}
+	objectKey := fmt.Sprintf("conversations/%s/%s", convID.String(), path)
+	sessionName := fmt.Sprintf("liteflow-%s", convID.String())
+	cred, err := h.stsProvider.IssueUploadSTS(r.Context(), sessionName, objectKey)
+	if err != nil {
+		InternalError(w, "failed to generate upload sts")
+		return
+	}
+
+	OK(w, map[string]any{
+		"region":          cred.Region,
+		"endpoint":        cred.Endpoint,
+		"bucket":          cred.Bucket,
+		"accessKeyId":     cred.AccessKeyID,
+		"accessKeySecret": cred.AccessKeySecret,
+		"securityToken":   cred.SecurityToken,
+		"expiration":      cred.Expiration,
+		"objectKey":       objectKey,
+		"path":            path,
+	})
+}
+
+func (h *ArtifactHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 	_, err := auth.GetUserID(r.Context())
 	if err != nil {
 		Unauthorized(w, "unauthorized")
@@ -101,53 +165,54 @@ func (h *ArtifactHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if parseErr := r.ParseMultipartForm(12 << 20); parseErr != nil {
-		BadRequest(w, "invalid multipart form")
+	var body struct {
+		Path     string `json:"path"`
+		FileName string `json:"fileName"`
+		Size     int64  `json:"size"`
+		MimeType string `json:"mimeType"`
+	}
+	if err := DecodeJSON(r, &body); err != nil {
+		BadRequest(w, "invalid request body")
 		return
 	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		BadRequest(w, "file is required")
-		return
-	}
-	defer file.Close()
-
-	if header.Size <= 0 {
+	if body.Size <= 0 {
 		BadRequest(w, "empty file is not allowed")
 		return
 	}
-
-	content, readErr := io.ReadAll(file)
-	if readErr != nil {
-		InternalError(w, "failed to read uploaded file")
+	storedPath := strings.TrimPrefix(strings.TrimSpace(body.Path), "/")
+	if storedPath == "" || strings.Contains(storedPath, "..") || strings.HasPrefix(storedPath, "/") {
+		BadRequest(w, "invalid file path")
 		return
 	}
-	if len(content) == 0 {
-		BadRequest(w, "empty file is not allowed")
-		return
+	baseName, nameErr := normalizeUploadFileName(body.FileName)
+	if nameErr != nil {
+		baseName, nameErr = normalizeUploadFileName(filepath.Base(storedPath))
 	}
-
-	baseName := filepath.Base(header.Filename)
-	if baseName == "." || baseName == "/" || baseName == "" {
+	if nameErr != nil {
 		BadRequest(w, "invalid file name")
 		return
 	}
+	if !strings.HasPrefix(storedPath, "uploads/") {
+		BadRequest(w, "invalid upload path")
+		return
+	}
 
-	safeName := strings.ReplaceAll(baseName, " ", "_")
-	storedPath := fmt.Sprintf("uploads/%d_%s", time.Now().UnixMilli(), safeName)
-	typ := guessArtifactType(baseName, header.Header.Get("Content-Type"))
-	size := int64(len(content))
+	if _, readErr := h.storageSvc.ReadFile(r.Context(), convID.String(), storedPath); readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			BadRequest(w, "uploaded file not found")
+		} else {
+			InternalError(w, "failed to verify uploaded file")
+		}
+		return
+	}
+
+	typ := guessArtifactType(baseName, body.MimeType)
+	size := body.Size
 	title := baseName
 	metaBytes, _ := json.Marshal(map[string]any{
 		"source":    "upload",
-		"mime_type": header.Header.Get("Content-Type"),
+		"mime_type": body.MimeType,
 	})
-
-	if err := h.storageSvc.UploadFile(r.Context(), convID.String(), storedPath, content); err != nil {
-		InternalError(w, "failed to store uploaded file")
-		return
-	}
 
 	a := &domain.Artifact{
 		ConversationID: convID,
@@ -335,4 +400,56 @@ func guessArtifactType(name, mimeType string) string {
 		return string(domain.ArtifactTypeImage)
 	}
 	return string(domain.ArtifactTypeFile)
+}
+
+func normalizeUploadFileName(raw string) (string, error) {
+	name := filepath.Base(strings.TrimSpace(raw))
+	if name == "" || name == "." || name == "/" {
+		return "", fmt.Errorf("invalid file name")
+	}
+
+	name = uploadNameSanitizeRegex.ReplaceAllString(name, "_")
+	name = strings.Trim(name, "._-")
+	if name == "" {
+		return "", fmt.Errorf("invalid file name")
+	}
+
+	ext := strings.ToLower(filepath.Ext(name))
+	base := strings.TrimSuffix(name, ext)
+	base = strings.Trim(base, "._-")
+	if base == "" {
+		base = "file"
+	}
+	if len(base) > maxUploadBaseNameLen {
+		base = base[:maxUploadBaseNameLen]
+		base = strings.TrimRight(base, "._-")
+		if base == "" {
+			base = "file"
+		}
+	}
+
+	if ext != "" {
+		if len(ext) > 12 || strings.Contains(ext, "..") {
+			ext = ""
+		}
+	}
+	return base + ext, nil
+}
+
+func normalizeOrGenerateUploadPath(requestPath, normalizedBaseName string) (string, error) {
+	candidate := strings.TrimPrefix(strings.TrimSpace(requestPath), "/")
+	if candidate == "" {
+		return fmt.Sprintf("uploads/%d_%s", time.Now().UnixMilli(), normalizedBaseName), nil
+	}
+	if strings.Contains(candidate, "..") || strings.HasPrefix(candidate, "/") {
+		return "", fmt.Errorf("invalid path")
+	}
+	if !strings.HasPrefix(candidate, "uploads/") {
+		return "", fmt.Errorf("invalid path")
+	}
+	filePart := filepath.Base(candidate)
+	if filePart == "" || filePart == "." || filePart == "/" {
+		return "", fmt.Errorf("invalid path")
+	}
+	return candidate, nil
 }
