@@ -20,6 +20,7 @@ const (
 	EventArtifactCreate    EventType = "artifact_created"
 	EventArtifactUpdate    EventType = "artifact_updated"
 	EventError             EventType = "error"
+	EventSystemNotice      EventType = "system_notice"
 )
 
 func NewEvent(typ EventType, data map[string]any) Event {
@@ -74,6 +75,15 @@ func ToolResultEvent(toolUseID, status, content string, metadata map[string]any)
 func ErrorEvent(code, message string) Event {
 	return NewEvent(EventError, map[string]any{
 		"code":    code,
+		"message": message,
+	})
+}
+
+// SystemNoticeEvent carries a non-fatal informational message (e.g. auto
+// context compaction notice). Frontend may render it as a subtle banner or
+// ignore it; it must not interrupt the ongoing response.
+func SystemNoticeEvent(message string) Event {
+	return NewEvent(EventSystemNotice, map[string]any{
 		"message": message,
 	})
 }

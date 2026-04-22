@@ -36,13 +36,15 @@ type ExecuteOptions struct {
 type AgentLoop struct {
 	providerRouter *llm.ProviderRouter
 	toolRegistry   *tool.Registry
+	compactor      *llm.Compactor
 	mcpExecBuilder McpExecutorBuilder
 }
 
-func NewAgentLoop(providerRouter *llm.ProviderRouter, toolRegistry *tool.Registry) *AgentLoop {
+func NewAgentLoop(providerRouter *llm.ProviderRouter, toolRegistry *tool.Registry, compactor *llm.Compactor) *AgentLoop {
 	return &AgentLoop{
 		providerRouter: providerRouter,
 		toolRegistry:   toolRegistry,
+		compactor:      compactor,
 	}
 }
 
@@ -112,8 +114,24 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 
 		accumulators, iterContent, err := a.streamLLMResponse(ctx, req, usageAcc, events, opts)
 		if err != nil {
-			events <- ErrorEvent("agent_loop_error", "工具调用出错: "+err.Error())
-			return
+			if llm.IsContextExceeded(err) && a.compactor != nil {
+				slog.Warn("context exceeded, compacting and retrying once", "iteration", iteration)
+				newMsgs, cErr := a.compactor.Compact(ctx, req.Messages, req.Tools, llm.CompactOptions{Aggressive: true})
+				if cErr != nil {
+					events <- ErrorEvent("context_exceeded", "对话历史过长且压缩失败，请开启新会话: "+cErr.Error())
+					return
+				}
+				req.Messages = newMsgs
+				events <- SystemNoticeEvent("对话历史已自动压缩，继续响应中...")
+				accumulators, iterContent, err = a.streamLLMResponse(ctx, req, usageAcc, events, opts)
+				if err != nil {
+					events <- ErrorEvent("context_exceeded", "压缩后仍超限，请开启新会话: "+err.Error())
+					return
+				}
+			} else {
+				events <- ErrorEvent("agent_loop_error", "工具调用出错: "+err.Error())
+				return
+			}
 		}
 
 		if len(accumulators) == 0 {

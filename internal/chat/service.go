@@ -176,7 +176,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	}
 
 	memoryContext := s.buildMemoryContext(ctx, userID)
-	llmReq := s.contextAsm.Assemble(history, conv.ID.String(), memoryContext, "", &llm.AssembleOptions{
+	llmReq := s.contextAsm.Assemble(ctx, history, conv.ID.String(), memoryContext, "", &llm.AssembleOptions{
 		Provider:             rt.Provider,
 		ToolDefs:             rt.ToolDefs,
 		PromptModules:        rt.PromptModules,
@@ -363,7 +363,7 @@ func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, tas
 	if parentTC != nil && parentTC.UserID != uuid.Nil {
 		subAgentMemoryContext = s.buildMemoryContext(ctx, parentTC.UserID)
 	}
-	llmReq := s.contextAsm.Assemble([]domain.Message{inputMsg}, conversationID, subAgentMemoryContext, "", &llm.AssembleOptions{
+	llmReq := s.contextAsm.Assemble(ctx, []domain.Message{inputMsg}, conversationID, subAgentMemoryContext, "", &llm.AssembleOptions{
 		Provider:             rt.Provider,
 		ToolDefs:             rt.ToolDefs,
 		PromptModules:        rt.PromptModules,
@@ -642,7 +642,7 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		}
 
 		memoryContext := s.buildMemoryContext(ctx, userID)
-		llmReq := s.contextAsm.Assemble(history, conversationID, memoryContext, "", &llm.AssembleOptions{
+		llmReq := s.contextAsm.Assemble(ctx, history, conversationID, memoryContext, "", &llm.AssembleOptions{
 			Provider:             rt.Provider,
 			ToolDefs:             rt.ToolDefs,
 			PromptModules:        rt.PromptModules,

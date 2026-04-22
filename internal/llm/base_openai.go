@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -84,6 +85,9 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if provErr := ParseProviderError(resp.StatusCode, body); provErr != nil {
+			return nil, provErr
+		}
 		return nil, fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -111,6 +115,18 @@ func (p *BaseOpenAIProvider) StreamChat(ctx context.Context, req *LlmRequest) (<
 
 			chunk, err := p.extractChunk(data)
 			if err != nil {
+				// Provider error frames (200 + data: {"error":...}) must surface
+				// to the caller; transient JSON parse failures get logged and
+				// skipped so a single malformed frame doesn't abort the stream.
+				var provErr *ErrProviderStreamError
+				var ctxErr *ErrContextExceeded
+				if errors.As(err, &ctxErr) || errors.As(err, &provErr) {
+					select {
+					case ch <- LlmChunk{Err: err}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				slog.Warn("failed to parse SSE chunk", "err", err, "data", data)
 				continue
 			}
@@ -164,6 +180,9 @@ func (p *BaseOpenAIProvider) Chat(ctx context.Context, req *LlmRequest) (*LlmRes
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if provErr := ParseProviderError(resp.StatusCode, body); provErr != nil {
+			return nil, provErr
+		}
 		return nil, fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -246,6 +265,9 @@ func (p *BaseOpenAIProvider) buildRequestBody(req *LlmRequest, stream bool) map[
 }
 
 func (p *BaseOpenAIProvider) extractChunk(data string) (*LlmChunk, error) {
+	if provErr := ParseProviderError(200, []byte(data)); provErr != nil {
+		return nil, provErr
+	}
 	var raw openAIStreamChunk
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
 		return nil, err

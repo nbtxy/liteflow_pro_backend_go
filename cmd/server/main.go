@@ -249,10 +249,11 @@ func main() {
 	// Context Assembler
 	promptEngine := llm.NewPromptTemplateEngine()
 	toolDefs := toolRegistry.BuildToolDefinitions()
-	contextAsm := llm.NewContextAssembler(promptEngine, providerRouter, storageSvc, ossLinkSvc, toolDefs)
+	compactor := llm.NewCompactor(providerRouter)
+	contextAsm := llm.NewContextAssembler(promptEngine, providerRouter, storageSvc, ossLinkSvc, toolDefs, compactor)
 
 	// Agent Loop
-	agentLoop := agent.NewAgentLoop(providerRouter, toolRegistry)
+	agentLoop := agent.NewAgentLoop(providerRouter, toolRegistry, compactor)
 	agentLoop.SetMcpExecutorBuilder(func(ctx context.Context, userIDStr string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error) {
 		uid, err := uuid.Parse(userIDStr)
 		if err != nil {

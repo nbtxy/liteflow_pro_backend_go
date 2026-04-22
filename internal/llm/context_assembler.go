@@ -17,6 +17,9 @@ import (
 const (
 	ReservedOutputTokens         = 4096
 	ToolDefinitionsTokenEstimate = 800
+	ImageTokenEstimate           = 1000 // conservative per-image budget
+	CompactTriggerRatio          = 0.85 // trigger proactive compaction above this fraction of max context
+	MinTruncatedUserMessage      = 100  // minimum tokens kept when hard-truncating a latest user message
 )
 
 type ContextAssembler struct {
@@ -26,6 +29,7 @@ type ContextAssembler struct {
 	ossLinkSvc     storage.Service
 	toolDefs       []ToolDefinition
 	hasTools       bool
+	compactor      *Compactor
 }
 
 type AssembleOptions struct {
@@ -45,6 +49,7 @@ func NewContextAssembler(
 	storageSvc storage.Service,
 	ossLinkSvc storage.Service,
 	toolDefs []ToolDefinition,
+	compactor *Compactor,
 ) *ContextAssembler {
 	return &ContextAssembler{
 		templateEngine: templateEngine,
@@ -53,10 +58,11 @@ func NewContextAssembler(
 		ossLinkSvc:     ossLinkSvc,
 		toolDefs:       toolDefs,
 		hasTools:       len(toolDefs) > 0,
+		compactor:      compactor,
 	}
 }
 
-func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID string,
+func (ca *ContextAssembler) Assemble(ctx context.Context, history []domain.Message, conversationID string,
 	memoryContext string, toolSearchDescription string, opts *AssembleOptions) *LlmRequest {
 
 	selectedProvider := ca.providerRouter.Default()
@@ -125,29 +131,50 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 	historyBudget := maxContext - systemTokens - ReservedOutputTokens - toolTokens
 
 	var llmHistory []LlmMessage
+	historyTokens := 0
 	if len(history) > 0 {
 		currentTokens := 0
 		for i := len(history) - 1; i >= 0; i-- {
 			msg := history[i]
-			msgTokens := estimateTokens(extractMessageText(msg))
+			msgTokens := extractAllMessageTokens(msg)
 			if msg.TokenCount != nil {
 				msgTokens = int(*msg.TokenCount)
 			}
 
-			if currentTokens+msgTokens > historyBudget {
-				if i == len(history)-1 {
-					slog.Warn("latest message exceeds budget, including anyway")
-				} else {
-					break
-				}
+			overBudget := currentTokens+msgTokens > historyBudget
+			if overBudget && i != len(history)-1 {
+				break
 			}
 
 			expanded := buildLlmMessages(msg, conversationID, visionSupported, ca.storageSvc, ca.ossLinkSvc)
+
+			if overBudget && msg.Role == "user" {
+				allowed := historyBudget - currentTokens
+				if allowed < MinTruncatedUserMessage {
+					allowed = MinTruncatedUserMessage
+				}
+				for j := range expanded {
+					if expanded[j].Content != "" {
+						expanded[j].Content = hardTruncateText(expanded[j].Content, allowed)
+					}
+				}
+				slog.Warn("hard-truncated latest user message to fit budget",
+					"originalTokens", msgTokens, "allowedTokens", allowed)
+				msgTokens = allowed
+			} else if overBudget {
+				slog.Warn("latest message exceeds budget, including anyway",
+					"role", msg.Role, "msgTokens", msgTokens)
+			}
+
 			llmHistory = append(expanded, llmHistory...)
 			currentTokens += msgTokens
+			if overBudget {
+				break
+			}
 		}
 
 		llmHistory = sanitizeToolCallPairs(llmHistory)
+		historyTokens = currentTokens
 	}
 
 	req := &LlmRequest{
@@ -179,14 +206,30 @@ func (ca *ContextAssembler) Assemble(history []domain.Message, conversationID st
 		req.Tools = defs
 	}
 
+	estimatedTotal := systemTokens + historyTokens + toolTokens
 	slog.Info("context assembled",
 		"systemPromptTokens", systemTokens,
 		"historyMessages", len(llmHistory),
 		"historyBudget", historyBudget,
+		"estimatedTotalTokens", estimatedTotal,
+		"maxContext", maxContext,
 		"toolCount", len(defs),
 		"hasMemoryManageTool", hasMemoryManageTool,
 		"hasMemory", memoryContext != "",
 	)
+
+	if ca.compactor != nil && estimatedTotal > int(float64(maxContext)*CompactTriggerRatio) {
+		slog.Info("proactive compaction triggered",
+			"estimatedTotal", estimatedTotal,
+			"threshold", int(float64(maxContext)*CompactTriggerRatio),
+		)
+		compacted, cErr := ca.compactor.Compact(ctx, req.Messages, req.Tools, CompactOptions{KeepTailTurns: 3})
+		if cErr != nil {
+			slog.Warn("proactive compaction failed, sending original", "err", cErr)
+		} else {
+			req.Messages = compacted
+		}
+	}
 
 	return req
 }
@@ -640,6 +683,72 @@ func detectDataURLExt(header string) string {
 	default:
 		return ".png"
 	}
+}
+
+// extractAllMessageTokens accounts for text, tool_use arguments, tool_result
+// content, and image attachments — filling the gap that extractMessageText
+// (text-only) leaves when used as a budgeting signal.
+func extractAllMessageTokens(msg domain.Message) int {
+	total := 0
+
+	if len(msg.ContentParts) > 0 {
+		var parts []assistantContentPart
+		if err := json.Unmarshal(msg.ContentParts, &parts); err == nil {
+			for _, part := range parts {
+				switch part.Type {
+				case "text":
+					total += estimateTokens(part.Text)
+				case "tool_use":
+					if part.ToolCall != nil && part.ToolCall.Input != nil {
+						if b, err := json.Marshal(part.ToolCall.Input); err == nil {
+							total += estimateTokens(string(b))
+						}
+					}
+				case "tool_result":
+					total += estimateTokens(part.Content)
+				}
+			}
+		}
+	}
+
+	if len(msg.Metadata) > 0 {
+		var meta struct {
+			Attachments []struct {
+				Type string `json:"type"`
+			} `json:"attachments"`
+		}
+		if err := json.Unmarshal(msg.Metadata, &meta); err == nil {
+			for _, a := range meta.Attachments {
+				if a.Type == "image" {
+					total += ImageTokenEstimate
+				}
+			}
+		}
+	}
+
+	if total <= 0 {
+		total = 1
+	}
+	return total
+}
+
+// hardTruncateText cuts text to fit within approxTokens, appending a marker.
+// Uses a rough 2-chars-per-token heuristic to balance ASCII and non-ASCII.
+func hardTruncateText(text string, approxTokens int) string {
+	if approxTokens <= 0 {
+		return ""
+	}
+	maxChars := approxTokens * 2
+	if len(text) <= maxChars {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	truncated := string(runes[:maxChars])
+	omitted := len(runes) - maxChars
+	return truncated + fmt.Sprintf("\n... [省略 %d 字符]", omitted)
 }
 
 func estimateTokens(text string) int {
