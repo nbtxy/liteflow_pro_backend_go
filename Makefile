@@ -1,4 +1,4 @@
-.PHONY: build run dev test clean migrate db-up db-down db-logs
+.PHONY: build run build-local run-local dev test clean migrate db-up db-down db-logs
 
 APP_NAME=liteflow-backend
 BUILD_DIR=./build
@@ -8,6 +8,12 @@ build:
 
 run: build
 	$(BUILD_DIR)/$(APP_NAME)
+
+build-local:
+	go build -o $(BUILD_DIR)/$(APP_NAME)-local ./cmd/server
+
+run-local: build-local
+	$(BUILD_DIR)/$(APP_NAME)-local
 
 dev:
 	go run ./cmd/server

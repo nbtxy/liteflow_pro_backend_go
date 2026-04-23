@@ -11,6 +11,9 @@
 
 # Environment
 .env
+login.pem
+env_upload.sh
+build/
 
 # IDE
 .idea/
