@@ -56,4 +56,4 @@ docker-build:
 	docker build -t $(APP_NAME) .
 
 docker-run:
-	docker run -p 8081:8081 --env-file .env -e DB_HOST=host.docker.internal $(APP_NAME)
+	docker run -d -p 8081:8081 --env-file .env --add-host=host.docker.internal:host-gateway -e DB_HOST=host.docker.internal $(APP_NAME)
