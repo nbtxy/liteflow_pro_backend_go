@@ -65,6 +65,7 @@ func NewRouter(app *App) http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/files", app.ArtifactHandler.CompleteUpload)
 	mux.HandleFunc("POST /api/conversations/{id}/files/complete", app.ArtifactHandler.CompleteUpload)
 	mux.HandleFunc("GET /api/conversations/{id}/files/download", app.ArtifactHandler.DownloadFile)
+	mux.HandleFunc("GET /api/conversations/{id}/files/thumbnail-url", app.ArtifactHandler.GetThumbnailURL)
 	mux.HandleFunc("DELETE /api/conversations/{id}/files/delete", app.ArtifactHandler.DeleteFile)
 
 	// Artifacts

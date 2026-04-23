@@ -144,6 +144,29 @@ func (s *OSSService) GenerateUploadURL(_ context.Context, conversationID, path s
 	return normalizeSignedURL(urlStr)
 }
 
+func (s *OSSService) GenerateImageThumbnailURL(
+	_ context.Context,
+	conversationID,
+	path string,
+	width,
+	height,
+	expireMinutes int,
+) (string, error) {
+	objectKey := buildObjectKey(conversationID, path)
+	timeout := expireDuration(expireMinutes)
+	process := fmt.Sprintf("image/resize,m_fill,w_%d,h_%d", width, height)
+	urlStr, err := s.bucket.SignURL(
+		objectKey,
+		oss.HTTPGet,
+		int64(timeout.Seconds()),
+		oss.Process(process),
+	)
+	if err != nil {
+		return "", fmt.Errorf("sign thumbnail url %s: %w", objectKey, err)
+	}
+	return normalizeSignedURL(urlStr)
+}
+
 func buildObjectKey(conversationID, path string) string {
 	cleanPath := strings.TrimPrefix(path, "/")
 	return fmt.Sprintf("conversations/%s/%s", conversationID, cleanPath)

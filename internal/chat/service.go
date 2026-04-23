@@ -250,6 +250,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	var metadata json.RawMessage
 	metaMap := map[string]any{}
 	applyStreamErrorFallback(&contentParts, runResult, metaMap)
+	contentParts = settleRunningToolCallsForPersistence(contentParts, "error")
 	normalizedParts := normalizeContentParts(contentParts)
 	if parts, err := json.Marshal(normalizedParts); err == nil {
 		assistantMsg.ContentParts = parts
@@ -715,6 +716,7 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		// Build metadata
 		metaMap := map[string]any{}
 		applyStreamErrorFallback(&contentParts, runResult, metaMap)
+		contentParts = settleRunningToolCallsForPersistence(contentParts, "error")
 		normalizedParts := normalizeContentParts(contentParts)
 		if parts, err := json.Marshal(normalizedParts); err == nil {
 			assistantMsg.ContentParts = parts
@@ -941,6 +943,83 @@ func extractTextFromContentParts(parts []map[string]any) string {
 		b.WriteString(mapString(part, "text"))
 	}
 	return b.String()
+}
+
+func settleRunningToolCallsForPersistence(parts []map[string]any, fallbackStatus string) []map[string]any {
+	if len(parts) == 0 {
+		return parts
+	}
+
+	statusByToolUseID := make(map[string]string, 8)
+	for _, part := range parts {
+		if mapString(part, "type") != "tool_result" {
+			continue
+		}
+		toolUseID := mapString(part, "toolUseId")
+		status := mapString(part, "status")
+		if toolUseID == "" || status == "" {
+			continue
+		}
+		statusByToolUseID[toolUseID] = status
+	}
+
+	nowMs := time.Now().UnixMilli()
+	for _, part := range parts {
+		if mapString(part, "type") != "tool_use" {
+			continue
+		}
+		toolCall, ok := part["toolCall"].(map[string]any)
+		if !ok || toolCall == nil {
+			continue
+		}
+
+		toolUseID := mapString(toolCall, "toolUseId")
+		if toolUseID == "" {
+			continue
+		}
+
+		status := mapString(toolCall, "status")
+		if status == "running" {
+			if settled := statusByToolUseID[toolUseID]; settled != "" {
+				toolCall["status"] = settled
+				status = settled
+			} else if fallbackStatus != "" {
+				toolCall["status"] = fallbackStatus
+				status = fallbackStatus
+			}
+		}
+
+		if status != "running" {
+			if _, ok := toolCall["duration"]; !ok {
+				if startedAt, ok := toInt64(toolCall["startedAt"]); ok && startedAt > 0 {
+					duration := nowMs - startedAt
+					if duration < 0 {
+						duration = 0
+					}
+					toolCall["duration"] = duration
+				}
+			}
+		}
+	}
+
+	return parts
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func normalizeContentParts(parts []map[string]any) []map[string]any {

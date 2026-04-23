@@ -3,7 +3,7 @@ package config
 import "time"
 
 type Config struct {
-	Port            int      `env:"PORT" envDefault:"8080"`
+	Port            int      `env:"PORT" envDefault:"8081"`
 	Env             string   `env:"APP_ENV" envDefault:"dev"`
 	AllowedOrigins  []string `env:"ALLOWED_ORIGINS" envSeparator:"," envDefault:"http://localhost:3000"`
 	FrontendURL     string   `env:"FRONTEND_URL" envDefault:"http://localhost:3000"`
@@ -23,7 +23,7 @@ type Config struct {
 
 type DBConfig struct {
 	Host     string `env:"DB_HOST" envDefault:"localhost"`
-	Port     int    `env:"DB_PORT" envDefault:"5432"`
+	Port     int    `env:"DB_PORT" envDefault:"5433"`
 	Name     string `env:"DB_NAME" envDefault:"liteflow"`
 	Username string `env:"DB_USERNAME" envDefault:"liteflow"`
 	Password string `env:"DB_PASSWORD"`

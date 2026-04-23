@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,10 @@ type ArtifactHandler struct {
 	artifactSvc *artifact.Service
 	storageSvc  storage.Service
 	stsProvider *storage.STSProvider
+}
+
+type imageThumbnailURLSigner interface {
+	GenerateImageThumbnailURL(ctx context.Context, conversationID, path string, width, height, expireMinutes int) (string, error)
 }
 
 const maxUploadBaseNameLen = 80
@@ -278,6 +284,60 @@ func (h *ArtifactHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(content)
+}
+
+func (h *ArtifactHandler) GetThumbnailURL(w http.ResponseWriter, r *http.Request) {
+	_, err := auth.GetUserID(r.Context())
+	if err != nil {
+		Unauthorized(w, "unauthorized")
+		return
+	}
+
+	convID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		BadRequest(w, "invalid conversation id")
+		return
+	}
+
+	filePath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if filePath == "" {
+		BadRequest(w, "path is required")
+		return
+	}
+
+	width := 160
+	if raw := strings.TrimSpace(r.URL.Query().Get("w")); raw != "" {
+		value, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || value <= 0 || value > 1024 {
+			BadRequest(w, "invalid width")
+			return
+		}
+		width = value
+	}
+
+	height := 160
+	if raw := strings.TrimSpace(r.URL.Query().Get("h")); raw != "" {
+		value, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || value <= 0 || value > 1024 {
+			BadRequest(w, "invalid height")
+			return
+		}
+		height = value
+	}
+
+	signer, ok := h.storageSvc.(imageThumbnailURLSigner)
+	if !ok {
+		InternalError(w, "thumbnail signer is not configured")
+		return
+	}
+
+	url, err := signer.GenerateImageThumbnailURL(r.Context(), convID.String(), filePath, width, height, 10)
+	if err != nil {
+		InternalError(w, "failed to generate thumbnail url")
+		return
+	}
+
+	OK(w, map[string]any{"url": url})
 }
 
 func (h *ArtifactHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
