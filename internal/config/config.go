@@ -83,10 +83,12 @@ type ProviderConfig struct {
 }
 
 type CloudflareConfig struct {
-	Endpoint   string `env:"CF_AI_GATEWAY_ENDPOINT"`
-	Model      string `env:"CF_AI_GATEWAY_MODEL" envDefault:"@cf/meta/llama-3.1-8b-instruct"`
-	Token      string `env:"CF_AIG_TOKEN"`
-	ImageModel string `env:"CF_AI_GATEWAY_IMAGE_MODEL" envDefault:"gemini-3.1-flash-image-preview"`
+	Endpoint         string `env:"CF_AI_GATEWAY_ENDPOINT"`
+	Model            string `env:"CF_AI_GATEWAY_MODEL" envDefault:"@cf/meta/llama-3.1-8b-instruct"`
+	Token            string `env:"CF_AIG_TOKEN"`
+	OpenAIAPIKey     string `env:"OPENAI_API_KEY"`
+	ImageModel       string `env:"CF_AI_GATEWAY_IMAGE_MODEL" envDefault:"gemini-3.1-flash-image-preview"`
+	OpenAIImageModel string `env:"CF_WORKERS_AI_OPENAI_IMAGE_MODEL" envDefault:"gpt-image-2"`
 }
 
 type MCPConfig struct {

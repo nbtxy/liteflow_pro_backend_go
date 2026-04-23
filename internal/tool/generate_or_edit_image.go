@@ -53,7 +53,7 @@ func NewImageGenerate(
 func (t *ImageGenerateTool) Name() string { return "generate_or_edit_image" }
 
 func (t *ImageGenerateTool) Description() string {
-	return "生成或编辑图像：仅给 prompt 时从零生成；传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（通过调用 Google Nano Banana 2，结果以 IMAGE artifact 返回）"
+	return "生成或编辑图像：支持 OpenAI 与 Nano Banana 两种模型链路；仅给 prompt 时从零生成，传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（结果以 IMAGE artifact 返回）"
 }
 
 func (t *ImageGenerateTool) InputSchema() map[string]any {
@@ -82,11 +82,12 @@ func (t *ImageGenerateTool) InputSchema() map[string]any {
 			},
 			"provider": map[string]any{
 				"type":        "string",
-				"description": "可选图片生成 provider 名称，不传则使用默认 provider",
+				"enum":        []string{"openai", "nano_banana", "cloudflare-openai-image", "cloudflare-gemini-image"},
+				"description": "可选模型链路：openai（Cloudflare OpenAI Image）或 nano_banana（Cloudflare Gemini Image）；也可传完整 provider 名称",
 			},
 			"model": map[string]any{
 				"type":        "string",
-				"description": "可选图片生成模型名，不传则使用默认模型",
+				"description": "可选模型名。不传则使用默认模型；若只传 model，会尝试自动推断 provider（如 openai/gpt-image-1.5 -> openai）",
 			},
 			"reference_image_paths": map[string]any{
 				"type":        "array",
@@ -145,12 +146,35 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 	}
 
 	selectedProviderName := t.defaultProvider
+	providerExplicit := false
 	if v, ok := input["provider"].(string); ok && strings.TrimSpace(v) != "" {
-		selectedProviderName = strings.TrimSpace(v)
+		selectedProviderName = normalizeImageProviderName(v)
+		providerExplicit = true
 	}
-	selectedModel := t.defaultModel
+	selectedModel := ""
+	modelExplicit := false
 	if v, ok := input["model"].(string); ok && strings.TrimSpace(v) != "" {
 		selectedModel = strings.TrimSpace(v)
+		modelExplicit = true
+		// 只传 model 时，按模型前缀自动选择链路，避免必须记完整 provider 名。
+		if rawProvider, ok := input["provider"].(string); !ok || strings.TrimSpace(rawProvider) == "" {
+			if inferred := inferImageProviderByModel(selectedModel); inferred != "" {
+				selectedProviderName = inferred
+			}
+		}
+	}
+	// 仅在使用默认 provider 且调用方没显式指定 model 时，才注入全局默认模型。
+	// 避免 provider 切换后继续携带不兼容模型（例如 openai 路由 + gemini 模型）。
+	if !modelExplicit && selectedProviderName == t.defaultProvider {
+		selectedModel = t.defaultModel
+	}
+	// 如果 provider/model 同时显式传入但语义冲突，优先按 model 推断 provider，减少 400。
+	if providerExplicit && modelExplicit {
+		if inferred := inferImageProviderByModel(selectedModel); inferred != "" && inferred != selectedProviderName {
+			slog.Warn("image provider/model mismatch, using provider inferred by model",
+				"provider", selectedProviderName, "model", selectedModel, "inferredProvider", inferred)
+			selectedProviderName = inferred
+		}
 	}
 
 	selectedProvider := t.providerRouter.Default()
@@ -381,6 +405,30 @@ func parseResolution(v any) (string, bool, error) {
 		return s, true, nil
 	default:
 		return "", false, fmt.Errorf("resolution must be one of: 512x512, 768x768, 1024x1024, 1024x1536, 1536x1024")
+	}
+}
+
+func normalizeImageProviderName(name string) string {
+	return "cloudflare-gemini-image"
+	// switch strings.ToLower(strings.TrimSpace(name)) {
+	// case "openai", "openai-image", "gpt-image", "workers-ai-openai":
+	// 	return "cloudflare-openai-image"
+	// case "nano_banana", "nano-banana", "nanobanana", "gemini", "gemini-image":
+	// 	return "cloudflare-gemini-image"
+	// default:
+	// 	return strings.TrimSpace(name)
+	// }
+}
+
+func inferImageProviderByModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(m, "openai/"), strings.Contains(m, "gpt-image"):
+		return "cloudflare-openai-image"
+	case strings.Contains(m, "gemini"), strings.Contains(m, "nano banana"), strings.Contains(m, "nanobanana"):
+		return "cloudflare-gemini-image"
+	default:
+		return ""
 	}
 }
 

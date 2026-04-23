@@ -107,6 +107,7 @@ func main() {
 	imageProviderRouter := imagegen.NewProviderRouter("cloudflare-gemini-image")
 	if cfg.LLM.Cloudflare.Endpoint != "" && cfg.LLM.Cloudflare.Token != "" {
 		imageProviderRouter.Register(imagegen.NewCloudflareGeminiProvider(cfg.LLM.Cloudflare))
+		imageProviderRouter.Register(imagegen.NewCloudflareOpenAIImageProvider(cfg.LLM.Cloudflare))
 	}
 
 	// Services
