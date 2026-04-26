@@ -17,7 +17,7 @@ func NewDeepSeekProvider(cfg config.ProviderConfig) *BaseOpenAIProvider {
 		APIKey:    cfg.APIKey,
 		Endpoint:  endpoint,
 		Model:     model,
-		MaxTokens: 64000,
+		MaxTokens: 1000000,
 		Vision:    false,
 	})
 }

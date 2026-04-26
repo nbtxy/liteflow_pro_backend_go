@@ -389,6 +389,23 @@ func buildIntermediateMessagesFromContentParts(parts []assistantContentPart) []L
 	result := make([]LlmMessage, 0, len(parts))
 	toolNameByID := make(map[string]string, 8)
 	var pendingText strings.Builder
+	pendingToolCalls := make([]ToolCall, 0, 2)
+
+	flushAssistant := func() {
+		if pendingText.Len() == 0 && len(pendingToolCalls) == 0 {
+			return
+		}
+		msg := LlmMessage{
+			Role:    "assistant",
+			Content: pendingText.String(),
+		}
+		if len(pendingToolCalls) > 0 {
+			msg.ToolCalls = append([]ToolCall(nil), pendingToolCalls...)
+		}
+		result = append(result, msg)
+		pendingText.Reset()
+		pendingToolCalls = pendingToolCalls[:0]
+	}
 
 	for _, part := range parts {
 		switch part.Type {
@@ -415,24 +432,20 @@ func buildIntermediateMessagesFromContentParts(parts []assistantContentPart) []L
 				toolNameByID[toolUseID] = toolName
 			}
 
-			result = append(result, LlmMessage{
-				Role:    "assistant",
-				Content: pendingText.String(),
-				ToolCalls: []ToolCall{{
-					ID:   toolUseID,
-					Type: "function",
-					Function: ToolCallFunc{
-						Name:      toolName,
-						Arguments: arguments,
-					},
-				}},
+			pendingToolCalls = append(pendingToolCalls, ToolCall{
+				ID:   toolUseID,
+				Type: "function",
+				Function: ToolCallFunc{
+					Name:      toolName,
+					Arguments: arguments,
+				},
 			})
-			pendingText.Reset()
 		case "tool_result":
 			toolUseID := part.ToolUseID
 			if toolUseID == "" {
 				continue
 			}
+			flushAssistant()
 			result = append(result, LlmMessage{
 				Role:       "tool",
 				Content:    part.Content,
@@ -442,29 +455,15 @@ func buildIntermediateMessagesFromContentParts(parts []assistantContentPart) []L
 		}
 	}
 
+	flushAssistant()
+
 	return result
 }
 
 func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
-	respondedIDs := make(map[string]bool)
-	requestedIDs := make(map[string]bool)
-
-	for _, msg := range messages {
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			respondedIDs[msg.ToolCallID] = true
-		}
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				if !isValidToolArgumentsJSON(tc.Function.Arguments) {
-					continue
-				}
-				requestedIDs[tc.ID] = true
-			}
-		}
-	}
-
 	var sanitized []LlmMessage
-	for _, msg := range messages {
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
 			validToolCalls := make([]ToolCall, 0, len(msg.ToolCalls))
 			for _, tc := range msg.ToolCalls {
@@ -483,6 +482,16 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 				continue
 			}
 
+			respondedIDs := make(map[string]bool, len(validToolCalls))
+			j := i + 1
+			for ; j < len(messages); j++ {
+				next := messages[j]
+				if next.Role != "tool" || next.ToolCallID == "" {
+					break
+				}
+				respondedIDs[next.ToolCallID] = true
+			}
+
 			allResponded := true
 			for _, tc := range validToolCalls {
 				if !respondedIDs[tc.ID] {
@@ -498,12 +507,26 @@ func sanitizeToolCallPairs(messages []LlmMessage) []LlmMessage {
 			}
 
 			msg.ToolCalls = validToolCalls
+			sanitized = append(sanitized, msg)
+
+			requestedIDs := make(map[string]bool, len(validToolCalls))
+			for _, tc := range validToolCalls {
+				requestedIDs[tc.ID] = true
+			}
+			for k := i + 1; k < j; k++ {
+				toolMsg := messages[k]
+				if requestedIDs[toolMsg.ToolCallID] {
+					sanitized = append(sanitized, toolMsg)
+				}
+			}
+			i = j - 1
+			continue
 		}
 
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			if !requestedIDs[msg.ToolCallID] {
-				continue
-			}
+		if msg.Role == "tool" {
+			// Keep tool messages only when consumed as the contiguous response
+			// block immediately following their assistant tool_calls message.
+			continue
 		}
 
 		sanitized = append(sanitized, msg)
