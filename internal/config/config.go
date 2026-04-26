@@ -48,6 +48,7 @@ type SMSConfig struct {
 	AliyunKeyID    string `env:"ALIYUN_SMS_KEY_ID"`
 	AliyunSecret   string `env:"ALIYUN_SMS_KEY_SECRET"`
 	AliyunEndpoint string `env:"ALIYUN_SMS_ENDPOINT" envDefault:"dysmsapi.aliyuncs.com"`
+	SignName       string `env:"ALIYUN_SMS_SIGN_NAME" envDefault:"LiteFlow"`
 	TemplateCode   string `env:"ALIYUN_SMS_TEMPLATE_CODE"`
 }
 
