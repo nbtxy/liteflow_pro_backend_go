@@ -324,6 +324,9 @@ func buildLlmMessages(
 					if a.Type != "" {
 						fileInfo += fmt.Sprintf(" (type=%s)", a.Type)
 					}
+					if strings.TrimSpace(a.URL) != "" {
+						fileInfo += fmt.Sprintf(" (path=%s)", a.URL)
+					}
 					textParts = append(textParts, fileInfo)
 				}
 

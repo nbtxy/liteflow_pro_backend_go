@@ -6,7 +6,6 @@ type Config struct {
 	Port            int      `env:"PORT" envDefault:"8081"`
 	Env             string   `env:"APP_ENV" envDefault:"dev"`
 	AllowedOrigins  []string `env:"ALLOWED_ORIGINS" envSeparator:"," envDefault:"http://localhost:3000"`
-	FrontendURL     string   `env:"FRONTEND_URL" envDefault:"http://localhost:3000"`
 	SuperAdminPhone string   `env:"SUPER_ADMIN_PHONE" envDefault:"13426112101"`
 	DebugEnabled    bool     `env:"DEBUG_ENABLED" envDefault:"true"`
 
