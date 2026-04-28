@@ -69,11 +69,13 @@ type SearchProviderConfig struct {
 }
 
 type LLMConfig struct {
-	DefaultProvider string         `env:"LLM_DEFAULT_PROVIDER" envDefault:"deepseek"`
-	DeepSeek        ProviderConfig `envPrefix:"DEEPSEEK_"`
-	Qwen            ProviderConfig `envPrefix:"QWEN_"`
-	OpenRouter      ProviderConfig `envPrefix:"OPENROUTER_"`
-	Cloudflare      CloudflareConfig
+	DefaultProvider       string         `env:"LLM_DEFAULT_PROVIDER" envDefault:"deepseek"`
+	DeepSeek              ProviderConfig `envPrefix:"DEEPSEEK_"`
+	Qwen                  ProviderConfig `envPrefix:"QWEN_"`
+	OpenRouter            ProviderConfig `envPrefix:"OPENROUTER_"`
+	OpenRouterImageModel  string         `env:"OPENROUTER_IMAGE_MODEL" envDefault:"openai/gpt-5.4-image-2"`
+	OpenRouterImagePhones []string       `env:"OPENROUTER_IMAGE_ALLOWED_PHONES" envSeparator:","`
+	Cloudflare            CloudflareConfig
 }
 
 type ProviderConfig struct {

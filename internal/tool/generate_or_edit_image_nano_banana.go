@@ -18,45 +18,20 @@ import (
 
 type RecordToolUsageFunc func(ctx context.Context, userID, conversationID, messageID uuid.UUID, usage *llm.LlmUsage)
 
-type ImageGenerateTool struct {
-	storageSvc      storage.Service
-	ossLinkSvc      storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
-	createArtifact  CreateImageArtifactFunc
-	recordUsage     RecordToolUsageFunc
-	providerRouter  *imagegen.ProviderRouter
-	defaultProvider string
-	defaultModel    string
+type imageGenerateBase struct {
+	storageSvc       storage.Service
+	ossLinkSvc       storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
+	createArtifact   CreateImageArtifactFunc
+	recordUsage      RecordToolUsageFunc
+	providerRouter   *imagegen.ProviderRouter
+	toolName         string
+	description      string
+	providerName     string
+	modelName        string
+	useReferenceURLs bool // when true, fetch reference images as OSS presigned URLs instead of downloading bytes
 }
 
-func NewImageGenerate(
-	storageSvc storage.Service,
-	ossLinkSvc storage.Service,
-	createArtifact CreateImageArtifactFunc,
-	recordUsage RecordToolUsageFunc,
-	providerRouter *imagegen.ProviderRouter,
-	defaultProvider string,
-	defaultModel string,
-) *ImageGenerateTool {
-	defaultProvider = strings.TrimSpace(defaultProvider)
-	defaultModel = strings.TrimSpace(defaultModel)
-	return &ImageGenerateTool{
-		storageSvc:      storageSvc,
-		ossLinkSvc:      ossLinkSvc,
-		createArtifact:  createArtifact,
-		recordUsage:     recordUsage,
-		providerRouter:  providerRouter,
-		defaultProvider: defaultProvider,
-		defaultModel:    defaultModel,
-	}
-}
-
-func (t *ImageGenerateTool) Name() string { return "generate_or_edit_image" }
-
-func (t *ImageGenerateTool) Description() string {
-	return "生成或编辑图像：固定使用 Nano Banana 模型链路；仅给 prompt 时从零生成，传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（结果以 IMAGE artifact 返回）"
-}
-
-func (t *ImageGenerateTool) InputSchema() map[string]any {
+func (t *imageGenerateBase) inputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
@@ -90,30 +65,7 @@ func (t *ImageGenerateTool) InputSchema() map[string]any {
 	}
 }
 
-type geminiPart struct {
-	Text       string          `json:"text,omitempty"`
-	InlineData *geminiInlineIn `json:"inlineData,omitempty"`
-}
-
-type geminiInlineIn struct {
-	MimeType string `json:"mimeType"`
-	Data     string `json:"data"`
-}
-
-type geminiChunk struct {
-	Candidates []struct {
-		Content struct {
-			Parts []geminiPart `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata,omitempty"`
-}
-
-func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, tc *ToolContext) (*ToolResult, error) {
+func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, tc *ToolContext) (*ToolResult, error) {
 	prompt, _ := input["prompt"].(string)
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -136,14 +88,14 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 		return &ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 
-	selectedProviderName := "cloudflare-gemini-image"
-	selectedModel := t.defaultModel
+	selectedProviderName := t.providerName
+	selectedModel := t.modelName
 	selectedProvider, getErr := t.providerRouter.Get(selectedProviderName)
 	if getErr != nil {
 		return &ToolResult{Content: getErr.Error(), IsError: true}, nil
 	}
 	if selectedProvider == nil {
-		return &ToolResult{Content: "nano banana provider unavailable", IsError: true}, nil
+		return &ToolResult{Content: fmt.Sprintf("image provider unavailable: %s", selectedProviderName), IsError: true}, nil
 	}
 
 	t.emitNarration(ctx, "已接收图像任务，开始准备输入...")
@@ -178,7 +130,7 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 	resp, err := selectedProvider.Generate(ctx, providerReq, func(delta string) {
 		events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
 			"content": delta,
-			"source":  "tool:generate_or_edit_image",
+			"source":  "tool:" + t.toolName,
 		}))
 	})
 	if err != nil {
@@ -246,7 +198,7 @@ func (t *ImageGenerateTool) Execute(ctx context.Context, input map[string]any, t
 }
 
 // presignedURLForGeneratedImage mirrors the image to OSS when ossLinkSvc is set and returns an Aliyun HTTPS presigned URL; on OSS failure falls back to storageSvc (e.g. local /api/files path).
-func (t *ImageGenerateTool) presignedURLForGeneratedImage(ctx context.Context, conversationID, filename string, imageBytes []byte, expireMinutes int) (string, error, bool) {
+func (t *imageGenerateBase) presignedURLForGeneratedImage(ctx context.Context, conversationID, filename string, imageBytes []byte, expireMinutes int) (string, error, bool) {
 	if t.ossLinkSvc != nil {
 		if err := t.ossLinkSvc.UploadFile(ctx, conversationID, filename, imageBytes); err != nil {
 			slog.Warn("upload generated image to OSS failed, using app storage URL", "path", filename, "err", err)
@@ -262,14 +214,14 @@ func (t *ImageGenerateTool) presignedURLForGeneratedImage(ctx context.Context, c
 	return u, err, false
 }
 
-func (t *ImageGenerateTool) emitNarration(ctx context.Context, content string) {
+func (t *imageGenerateBase) emitNarration(ctx context.Context, content string) {
 	events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
 		"content": content,
-		"source":  "tool:generate_or_edit_image",
+		"source":  "tool:" + t.toolName,
 	}))
 }
 
-func (t *ImageGenerateTool) recordToolUsage(ctx context.Context, tc *ToolContext, usage *llm.LlmUsage) {
+func (t *imageGenerateBase) recordToolUsage(ctx context.Context, tc *ToolContext, usage *llm.LlmUsage) {
 	if t.recordUsage == nil || tc == nil || usage == nil || usage.TotalTokens() <= 0 {
 		return
 	}
@@ -277,6 +229,65 @@ func (t *ImageGenerateTool) recordToolUsage(ctx context.Context, tc *ToolContext
 		return
 	}
 	t.recordUsage(ctx, tc.UserID, tc.ConversationID, tc.MessageID, usage)
+}
+
+func (t *imageGenerateBase) fetchReferenceImageByPath(ctx context.Context, conversationID, filePath string) (imagegen.InputImage, error) {
+	if t.useReferenceURLs && t.ossLinkSvc != nil {
+		url, err := t.ossLinkSvc.GeneratePresignedURL(ctx, conversationID, filePath, "GET", 30)
+		if err != nil {
+			return imagegen.InputImage{}, fmt.Errorf("presign reference image: %w", err)
+		}
+		return imagegen.InputImage{URL: url}, nil
+	}
+	data, err := t.storageSvc.ReadFile(ctx, conversationID, filePath)
+	if err != nil {
+		return imagegen.InputImage{}, fmt.Errorf("read file by path: %w", err)
+	}
+	mime := http.DetectContentType(data)
+	if !strings.HasPrefix(mime, "image/") {
+		return imagegen.InputImage{}, fmt.Errorf("not an image: %s", mime)
+	}
+	return imagegen.InputImage{
+		MimeType: mime,
+		Data:     data,
+	}, nil
+}
+
+type NanoBananaImageGenerateTool struct {
+	base imageGenerateBase
+}
+
+func NewNanoBananaImageGenerate(
+	storageSvc storage.Service,
+	ossLinkSvc storage.Service,
+	createArtifact CreateImageArtifactFunc,
+	recordUsage RecordToolUsageFunc,
+	providerRouter *imagegen.ProviderRouter,
+	modelName string,
+) *NanoBananaImageGenerateTool {
+	return &NanoBananaImageGenerateTool{
+		base: imageGenerateBase{
+			storageSvc:     storageSvc,
+			ossLinkSvc:     ossLinkSvc,
+			createArtifact: createArtifact,
+			recordUsage:    recordUsage,
+			providerRouter: providerRouter,
+			toolName:       "generate_or_edit_image_nano_banana",
+			description:    "生成或编辑图像：固定使用 Nano Banana（Cloudflare Gemini Image）模型链路；仅给 prompt 时从零生成，传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（结果以 IMAGE artifact 返回）",
+			providerName:   "cloudflare-gemini-image",
+			modelName:      strings.TrimSpace(modelName),
+		},
+	}
+}
+
+func (t *NanoBananaImageGenerateTool) Name() string { return t.base.toolName }
+
+func (t *NanoBananaImageGenerateTool) Description() string { return t.base.description }
+
+func (t *NanoBananaImageGenerateTool) InputSchema() map[string]any { return t.base.inputSchema() }
+
+func (t *NanoBananaImageGenerateTool) Execute(ctx context.Context, input map[string]any, tc *ToolContext) (*ToolResult, error) {
+	return t.base.execute(ctx, input, tc)
 }
 
 func extFromMime(mime string) string {
@@ -290,13 +301,6 @@ func extFromMime(mime string) string {
 	default:
 		return ".png"
 	}
-}
-
-func truncateForLog(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 func toStringSlice(v any) []string {
@@ -363,19 +367,4 @@ func parseResolution(v any) (string, bool, error) {
 	default:
 		return "", false, fmt.Errorf("resolution must be one of: 512x512, 768x768, 1024x1024, 1024x1536, 1536x1024")
 	}
-}
-
-func (t *ImageGenerateTool) fetchReferenceImageByPath(ctx context.Context, conversationID, filePath string) (imagegen.InputImage, error) {
-	data, err := t.storageSvc.ReadFile(ctx, conversationID, filePath)
-	if err != nil {
-		return imagegen.InputImage{}, fmt.Errorf("read file by path: %w", err)
-	}
-	mime := http.DetectContentType(data)
-	if !strings.HasPrefix(mime, "image/") {
-		return imagegen.InputImage{}, fmt.Errorf("not an image: %s", mime)
-	}
-	return imagegen.InputImage{
-		MimeType: mime,
-		Data:     data,
-	}, nil
 }

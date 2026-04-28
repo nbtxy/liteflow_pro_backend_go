@@ -27,3 +27,14 @@ type Tool interface {
 	InputSchema() map[string]any
 	Execute(ctx context.Context, input map[string]any, tc *ToolContext) (*ToolResult, error)
 }
+
+// UserScopedTool can be implemented by tools that should only be exposed to specific users.
+// When false, the tool should not be included in ToolDefs/ToolPool for that user.
+type UserScopedTool interface {
+	IsEnabledForUser(userID uuid.UUID) bool
+}
+
+// PhoneScopedTool can be implemented by tools that should be exposed by user phone whitelist.
+type PhoneScopedTool interface {
+	IsEnabledForPhone(phone string) bool
+}

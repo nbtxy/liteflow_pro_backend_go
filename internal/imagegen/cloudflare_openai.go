@@ -40,7 +40,7 @@ func NewCloudflareOpenAIImageProvider(cfg config.CloudflareConfig) *CloudflareOp
 func (p *CloudflareOpenAIImageProvider) Name() string { return "cloudflare-openai-image" }
 
 func (p *CloudflareOpenAIImageProvider) Generate(ctx context.Context, req *Request, textSink TextDeltaSink) (*Response, error) {
-	if strings.TrimSpace(p.endpoint) == "" || strings.TrimSpace(p.gatewayToken) == "" || strings.TrimSpace(p.openAIAPIKey) == "" {
+	if strings.TrimSpace(p.endpoint) == "" || strings.TrimSpace(p.gatewayToken) == "" {
 		return nil, fmt.Errorf("image generation not configured")
 	}
 	if req == nil || strings.TrimSpace(req.Prompt) == "" {
@@ -90,16 +90,20 @@ func (p *CloudflareOpenAIImageProvider) Generate(ctx context.Context, req *Reque
 		return nil, fmt.Errorf("build request failed: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	openAIAuthHeader := strings.TrimSpace(p.openAIAPIKey)
-	if !strings.HasPrefix(strings.ToLower(openAIAuthHeader), "bearer ") {
-		openAIAuthHeader = "Bearer " + openAIAuthHeader
-	}
 	gatewayAuthHeader := strings.TrimSpace(p.gatewayToken)
 	if !strings.HasPrefix(strings.ToLower(gatewayAuthHeader), "bearer ") {
 		gatewayAuthHeader = "Bearer " + gatewayAuthHeader
 	}
-	httpReq.Header.Set("Authorization", openAIAuthHeader)
 	httpReq.Header.Set("cf-aig-authorization", gatewayAuthHeader)
+	// Unified billing mode: when no upstream OpenAI key is configured, Cloudflare
+	// AI Gateway provides credentials and bills through the gateway. Only set the
+	// Authorization header in BYOK mode.
+	if openAIKey := strings.TrimSpace(p.openAIAPIKey); openAIKey != "" {
+		if !strings.HasPrefix(strings.ToLower(openAIKey), "bearer ") {
+			openAIKey = "Bearer " + openAIKey
+		}
+		httpReq.Header.Set("Authorization", openAIKey)
+	}
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
@@ -242,12 +246,11 @@ func clampImageCount(n int) int {
 
 func normalizeOpenAIImageModel(model string) string {
 	m := strings.TrimSpace(model)
-	switch strings.ToLower(m) {
-	case "", "openai/gpt-image-1.5", "gpt-image-1.5":
-		return "gpt-image-1"
-	case "openai/gpt-image-1":
-		return "gpt-image-1"
-	default:
-		return m
+	if m == "" {
+		return ""
 	}
+	if strings.HasPrefix(strings.ToLower(m), "openai/") {
+		m = m[len("openai/"):]
+	}
+	return m
 }

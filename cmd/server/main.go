@@ -104,10 +104,13 @@ func main() {
 	}
 
 	// Image Generation Providers
-	imageProviderRouter := imagegen.NewProviderRouter("cloudflare-gemini-image")
+	imageProviderRouter := imagegen.NewProviderRouter("openrouter-image")
 	if cfg.LLM.Cloudflare.Endpoint != "" && cfg.LLM.Cloudflare.Token != "" {
 		imageProviderRouter.Register(imagegen.NewCloudflareGeminiProvider(cfg.LLM.Cloudflare))
 		imageProviderRouter.Register(imagegen.NewCloudflareOpenAIImageProvider(cfg.LLM.Cloudflare))
+	}
+	if cfg.LLM.OpenRouter.APIKey != "" {
+		imageProviderRouter.Register(imagegen.NewOpenRouterImageProvider(cfg.LLM.OpenRouter, cfg.LLM.OpenRouterImageModel, cfg.LLM.Cloudflare.Endpoint, cfg.LLM.Cloudflare.Token))
 	}
 
 	// Services
@@ -212,8 +215,8 @@ func main() {
 	} else {
 		slog.Info("analyze_image tool disabled (qwen provider unavailable)")
 	}
-	if len(imageProviderRouter.Available()) > 0 {
-		toolRegistry.Register(tool.NewImageGenerate(
+	if _, err := imageProviderRouter.Get("cloudflare-gemini-image"); err == nil {
+		toolRegistry.Register(tool.NewNanoBananaImageGenerate(
 			storageSvc,
 			ossLinkSvc,
 			artifactSvc.CreateImageArtifact,
@@ -226,19 +229,46 @@ func main() {
 					userID,
 					conversationID,
 					messageID,
-					"Nano Banana2",
+					cfg.LLM.Cloudflare.ImageModel,
 					tokenUsage,
-					"tool_generate_or_edit_image",
+					"tool_generate_or_edit_image_nano_banana",
 					"tool",
 					0,
 				)
 			},
 			imageProviderRouter,
-			"cloudflare-gemini-image",
 			cfg.LLM.Cloudflare.ImageModel,
 		))
 	} else {
-		slog.Info("generate_or_edit_image tool disabled (no image generation provider available)")
+		slog.Info("generate_or_edit_image_nano_banana tool disabled (cloudflare-gemini-image unavailable)")
+	}
+	if _, err := imageProviderRouter.Get("openrouter-image"); err == nil {
+		toolRegistry.Register(tool.NewOpenRouterImageGenerate(
+			storageSvc,
+			ossLinkSvc,
+			artifactSvc.CreateImageArtifact,
+			func(ctx context.Context, userID, conversationID, messageID uuid.UUID, tokenUsage *llm.LlmUsage) {
+				if usageSvc == nil || tokenUsage == nil || tokenUsage.TotalTokens() <= 0 {
+					return
+				}
+				usageSvc.RecordAsync(
+					ctx,
+					userID,
+					conversationID,
+					messageID,
+					cfg.LLM.OpenRouterImageModel,
+					tokenUsage,
+					"tool_generate_or_edit_image_openrouter",
+					"tool",
+					0,
+				)
+			},
+			imageProviderRouter,
+			cfg.LLM.OpenRouterImageModel,
+			cfg.LLM.OpenRouterImagePhones,
+		))
+	} else {
+		slog.Info("generate_or_edit_image_openrouter tool disabled (openrouter-image unavailable)")
 	}
 	agentRegistry, err := agent_profile.LoadFromDir("./config/agents")
 	if err != nil {

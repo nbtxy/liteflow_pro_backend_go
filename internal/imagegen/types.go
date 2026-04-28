@@ -2,10 +2,13 @@ package imagegen
 
 import "github.com/liteflow/backend/internal/llm"
 
-// InputImage is a raw image input for image generation/editing.
+// InputImage is an image input for image generation/editing.
+// Either URL (preferred for providers that accept HTTPS, e.g. OpenRouter) or
+// Data (raw bytes, used by providers that require inline base64) should be set.
 type InputImage struct {
 	MimeType string
 	Data     []byte
+	URL      string
 }
 
 // Request is a provider-agnostic image generation request.

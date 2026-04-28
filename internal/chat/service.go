@@ -124,6 +124,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		}
 		rt = agentRT
 	}
+	s.applyUserToolAccess(ctx, rt, userID)
 	var resolvedAgentID *string
 	if rt != nil && strings.TrimSpace(rt.AgentID) != "" {
 		aid := rt.AgentID
@@ -306,6 +307,9 @@ func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, tas
 	if err != nil {
 		return "", err
 	}
+	if parentTC != nil {
+		s.applyUserToolAccess(ctx, rt, parentTC.UserID)
+	}
 	if rt == nil || rt.Provider == nil {
 		return "", nil
 	}
@@ -447,7 +451,7 @@ func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage 
 	temp := 0.5
 	titleReq := &llm.LlmRequest{
 		Messages:    []llm.LlmMessage{{Role: "user", Content: prompt}},
-		MaxTokens:   50,
+		MaxTokens:   200,
 		Temperature: &temp,
 	}
 
@@ -460,11 +464,31 @@ func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage 
 		return
 	}
 
-	title := strings.TrimSpace(resp.Content)
-	title = strings.ReplaceAll(title, "\"", "")
-	title = strings.ReplaceAll(title, "。", "")
+	rawTitle := resp.Content
+	title := strings.TrimSpace(rawTitle)
+	title = strings.Trim(title, "\"'`")
+	title = strings.TrimSuffix(title, "。")
+	title = strings.TrimSuffix(title, ".")
+	title = strings.TrimSpace(title)
 	if len(title) > 60 {
 		title = title[:60]
+	}
+
+	if title == "" {
+		// Fallback to first 20 chars of the user message so the conversation
+		// gets a non-empty title even if the LLM returns blank/punctuation.
+		fallback := strings.TrimSpace(firstMessage)
+		runes := []rune(fallback)
+		if len(runes) > 20 {
+			fallback = string(runes[:20])
+		}
+		title = fallback
+	}
+
+	if title == "" {
+		slog.Warn("title generation produced empty result; skipping update",
+			"conversationId", conv.ID, "rawResponse", rawTitle)
+		return
 	}
 
 	if err := s.convSvc.UpdateTitle(ctx, conv.ID, title); err != nil {
@@ -472,7 +496,7 @@ func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage 
 		return
 	}
 
-	slog.Info("generated title", "conversationId", conv.ID, "title", title)
+	slog.Info("generated title", "conversationId", conv.ID, "title", title, "raw", rawTitle)
 }
 
 func parseStringSlice(v any) []string {
@@ -551,6 +575,58 @@ func (s *Service) newDefaultRuntime() *agent_profile.AgentRuntime {
 	}
 }
 
+func (s *Service) applyUserToolAccess(ctx context.Context, rt *agent_profile.AgentRuntime, userID uuid.UUID) {
+	if rt == nil || len(rt.EnabledToolSet) == 0 {
+		return
+	}
+	userPhone := ""
+	loadedPhone := false
+	filtered := make(map[string]tool.Tool, len(rt.EnabledToolSet))
+	for name, t := range rt.EnabledToolSet {
+		if scoped, ok := t.(tool.UserScopedTool); ok && !scoped.IsEnabledForUser(userID) {
+			continue
+		}
+		if scopedByPhone, ok := t.(tool.PhoneScopedTool); ok {
+			if !loadedPhone {
+				userPhone = s.resolveUserPhone(ctx, userID)
+				loadedPhone = true
+			}
+			if !scopedByPhone.IsEnabledForPhone(userPhone) {
+				continue
+			}
+		}
+		filtered[name] = t
+	}
+	rt.EnabledToolSet = filtered
+	rt.ToolDefs = buildToolDefsFromPool(filtered)
+}
+
+func (s *Service) resolveUserPhone(ctx context.Context, userID uuid.UUID) string {
+	if s == nil || s.userSvc == nil || userID == uuid.Nil {
+		return ""
+	}
+	u, err := s.userSvc.GetByID(ctx, userID)
+	if err != nil || u == nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Phone)
+}
+
+func buildToolDefsFromPool(pool map[string]tool.Tool) []llm.ToolDefinition {
+	defs := make([]llm.ToolDefinition, 0, len(pool))
+	for _, t := range pool {
+		defs = append(defs, llm.ToolDefinition{
+			Type: "function",
+			Function: llm.ToolFunction{
+				Name:        t.Name(),
+				Description: t.Description(),
+				Parameters:  t.InputSchema(),
+			},
+		})
+	}
+	return defs
+}
+
 func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID) <-chan agent.Event {
 	events := make(chan agent.Event, 64)
 
@@ -593,6 +669,7 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			}
 			rt = agentRT
 		}
+		s.applyUserToolAccess(ctx, rt, userID)
 		var resolvedAgentID *string
 		if rt != nil && strings.TrimSpace(rt.AgentID) != "" {
 			aid := rt.AgentID

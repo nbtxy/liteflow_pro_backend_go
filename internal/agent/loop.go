@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	MaxIterations           = 20
-	ToolTimeout             = 30 * time.Second
-	AnalyzeImageToolTimeout = 120 * time.Second
-	LLMIterationTimeout     = 180 * time.Second
-	MaxToolResult           = 200000
+	MaxIterations            = 20
+	ToolTimeout              = 30 * time.Second
+	AnalyzeImageToolTimeout  = 120 * time.Second
+	GenerateImageToolTimeout = 300 * time.Second
+	LLMIterationTimeout      = 180 * time.Second
+	MaxToolResult            = 200000
 )
 
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error)
@@ -345,7 +346,11 @@ func toToolCallSlice(calls []toolCallInfo) []llm.ToolCall {
 func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCallInfo,
 	toolCtx *tool.ToolContext, mcpTools map[string]tool.Tool, opts *ExecuteOptions, emit func(Event)) (llm.LlmMessage, *tool.ToolResult) {
 
-	slog.Info("tool executing", "toolName", tc.name, "callId", tc.id)
+	slog.Info("tool executing",
+		"toolName", tc.name,
+		"callId", tc.id,
+		"timeoutSec", int(toolTimeout(tc.name).Seconds()),
+	)
 
 	var input map[string]any
 	var argsParseErr error
@@ -408,11 +413,15 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	}
 	resultContent := truncateToolResult(result.Content)
 
-	slog.Info("tool executed",
+	logArgs := []any{
 		"toolName", tc.name,
 		"status", status,
 		"durationMs", durationMs,
-	)
+	}
+	if result.IsError {
+		logArgs = append(logArgs, "error", resultContent)
+	}
+	slog.Info("tool executed", logArgs...)
 
 	emit(ToolResultEvent(tc.id, status, resultContent, result.Metadata))
 
@@ -532,6 +541,8 @@ func toolTimeout(toolName string) time.Duration {
 	switch toolName {
 	case "analyze_image":
 		return AnalyzeImageToolTimeout
+	case "generate_or_edit_image_nano_banana", "generate_or_edit_image_openrouter":
+		return GenerateImageToolTimeout
 	default:
 		return ToolTimeout
 	}
