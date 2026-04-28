@@ -73,6 +73,7 @@ type LLMConfig struct {
 	DeepSeek              ProviderConfig `envPrefix:"DEEPSEEK_"`
 	Qwen                  ProviderConfig `envPrefix:"QWEN_"`
 	OpenRouter            ProviderConfig `envPrefix:"OPENROUTER_"`
+	Seedance              SeedanceConfig `envPrefix:"SEEDANCE_"`
 	OpenRouterImageModel  string         `env:"OPENROUTER_IMAGE_MODEL" envDefault:"openai/gpt-5.4-image-2"`
 	OpenRouterImagePhones []string       `env:"OPENROUTER_IMAGE_ALLOWED_PHONES" envSeparator:","`
 	Cloudflare            CloudflareConfig
@@ -82,6 +83,16 @@ type ProviderConfig struct {
 	APIKey   string `env:"API_KEY"`
 	Endpoint string `env:"ENDPOINT"`
 	Model    string `env:"MODEL"`
+}
+
+type SeedanceConfig struct {
+	APIKey                 string   `env:"API_KEY"`
+	Endpoint               string   `env:"ENDPOINT"`
+	Model                  string   `env:"MODEL" envDefault:"doubao-seedance-2-0-260128"`
+	AllowedPhones          []string `env:"ALLOWED_PHONES" envSeparator:","`
+	StatusEndpointTemplate string   `env:"STATUS_ENDPOINT_TEMPLATE"`
+	PollIntervalSeconds    int      `env:"POLL_INTERVAL_SECONDS" envDefault:"5"`
+	TimeoutSeconds         int      `env:"TIMEOUT_SECONDS" envDefault:"300"`
 }
 
 type CloudflareConfig struct {

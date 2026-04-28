@@ -541,7 +541,7 @@ func toolTimeout(toolName string) time.Duration {
 	switch toolName {
 	case "analyze_image":
 		return AnalyzeImageToolTimeout
-	case "generate_or_edit_image_nano_banana", "generate_or_edit_image_openrouter":
+	case "generate_or_edit_image_nano_banana", "generate_or_edit_image_openrouter", "generate_video_seedance":
 		return GenerateImageToolTimeout
 	default:
 		return ToolTimeout

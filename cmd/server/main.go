@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -269,6 +270,16 @@ func main() {
 		))
 	} else {
 		slog.Info("generate_or_edit_image_openrouter tool disabled (openrouter-image unavailable)")
+	}
+	if strings.TrimSpace(cfg.LLM.Seedance.APIKey) != "" {
+		toolRegistry.Register(tool.NewSeedanceVideoGenerate(
+			storageSvc,
+			ossLinkSvc,
+			artifactSvc.CreateVideoArtifact,
+			cfg.LLM.Seedance,
+		))
+	} else {
+		slog.Info("generate_video_seedance tool disabled (SEEDANCE_API_KEY missing)")
 	}
 	agentRegistry, err := agent_profile.LoadFromDir("./config/agents")
 	if err != nil {

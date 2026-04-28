@@ -13,18 +13,21 @@ import (
 type CreateFileArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path, content string) (map[string]any, error)
 
 type CreateImageArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path string, data []byte, mimeType string) (map[string]any, error)
+type CreateVideoArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path string, data []byte, mimeType string) (map[string]any, error)
 
 type CreateFileTool struct {
-	storageSvc      storage.Service
-	createArtifact  CreateFileArtifactFunc
+	storageSvc     storage.Service
+	createArtifact CreateFileArtifactFunc
 }
 
 func NewCreateFile(storageSvc storage.Service, createArtifact CreateFileArtifactFunc) *CreateFileTool {
 	return &CreateFileTool{storageSvc: storageSvc, createArtifact: createArtifact}
 }
 
-func (t *CreateFileTool) Name() string        { return "create_file" }
-func (t *CreateFileTool) Description() string  { return "在对话中创建或覆盖文件，用于生成代码、文档等内容" }
+func (t *CreateFileTool) Name() string { return "create_file" }
+func (t *CreateFileTool) Description() string {
+	return "在对话中创建或覆盖文件，用于生成代码、文档等内容"
+}
 func (t *CreateFileTool) InputSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
