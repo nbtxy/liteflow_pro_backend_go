@@ -52,8 +52,8 @@ func (t *imageGenerateBase) inputSchema() map[string]any {
 			},
 			"resolution": map[string]any{
 				"type":        "string",
-				"enum":        []string{"512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"},
-				"description": "可选输出分辨率（宽x高）",
+				"enum":        []string{"512", "1K", "2K"},
+				"description": "可选输出分辨率（Gemini image_size），最大支持 2K（512/1K/2K）",
 			},
 			"reference_image_paths": map[string]any{
 				"type":        "array",
@@ -365,10 +365,22 @@ func parseResolution(v any) (string, bool, error) {
 	if s == "" {
 		return "", false, nil
 	}
-	switch s {
-	case "512x512", "768x768", "1024x1024", "1024x1536", "1536x1024":
-		return s, true, nil
+
+	upper := strings.ToUpper(s)
+	switch upper {
+	case "512", "1K", "2K":
+		return upper, true, nil
+	case "4K":
+		// Cap output resolution at 2K for stability/cost control.
+		return "2K", true, nil
+	// backward compatibility for legacy resolution values.
+	case "512X512":
+		return "512", true, nil
+	case "768X768", "1024X1024":
+		return "1K", true, nil
+	case "1024X1536", "1536X1024":
+		return "2K", true, nil
 	default:
-		return "", false, fmt.Errorf("resolution must be one of: 512x512, 768x768, 1024x1024, 1024x1536, 1536x1024")
+		return "", false, fmt.Errorf("resolution must be one of: 512, 1K, 2K")
 	}
 }

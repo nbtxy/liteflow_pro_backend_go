@@ -1,7 +1,6 @@
 package imagegen
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -79,9 +78,12 @@ func (p *CloudflareGeminiProvider) Generate(ctx context.Context, req *Request, t
 	if req.AspectRatio != "" {
 		imageConfig["aspectRatio"] = req.AspectRatio
 	}
+	if strings.TrimSpace(req.Resolution) != "" {
+		imageConfig["imageSize"] = strings.TrimSpace(req.Resolution)
+	}
 	// NOTE:
 	// Current Google AI Studio streamGenerateContent schema behind this gateway
-	// does not accept imageConfig.numberOfImages / imageConfig.resolution.
+	// does not accept imageConfig.numberOfImages.
 	// Keep provider-specific compatibility by only sending supported fields.
 	if len(imageConfig) > 0 {
 		genConfig["imageConfig"] = imageConfig
@@ -100,14 +102,14 @@ func (p *CloudflareGeminiProvider) Generate(ctx context.Context, req *Request, t
 		return nil, fmt.Errorf("marshal request failed: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/google-ai-studio/v1beta/models/%s:streamGenerateContent?alt=sse", p.endpoint, model)
+	url := fmt.Sprintf("%s/google-ai-studio/v1beta/models/%s:generateContent", p.endpoint, model)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request failed: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("cf-aig-authorization", "Bearer "+p.token)
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Accept", "application/json")
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
@@ -123,64 +125,44 @@ func (p *CloudflareGeminiProvider) Generate(ctx context.Context, req *Request, t
 		return nil, fmt.Errorf("image gateway error: %d %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
+	rawResponseBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, context.DeadlineExceeded
+		}
+		return nil, fmt.Errorf("read response failed: %w", err)
+	}
+	rawResponse := string(rawResponseBytes)
+
+	var parsed geminiGenerateResponse
+	if unmarshalErr := json.Unmarshal(rawResponseBytes, &parsed); unmarshalErr != nil {
+		slog.Error("gemini response parse failed", "model", model, "err", unmarshalErr, "raw_response", truncateForLog(rawResponse, 8192))
+		return nil, fmt.Errorf("parse response failed: %w", unmarshalErr)
+	}
+
 	var imageB64 strings.Builder
 	mimeType := "image/png"
 	usageAcc := &llm.LlmUsage{}
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimRight(line, "\r\n")
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if payload == "" || payload == "[DONE]" {
-					if readErr != nil {
-						break
-					}
-					continue
-				}
-
-				var chunk geminiChunk
-				if unmarshalErr := json.Unmarshal([]byte(payload), &chunk); unmarshalErr != nil {
-					slog.Warn("gemini chunk parse failed", "err", unmarshalErr, "payload", truncateForLog(payload, 200))
-				} else {
-					if chunk.UsageMetadata != nil {
-						if chunk.UsageMetadata.PromptTokenCount > usageAcc.InputTokens {
-							usageAcc.InputTokens = chunk.UsageMetadata.PromptTokenCount
-						}
-						if chunk.UsageMetadata.CandidatesTokenCount > usageAcc.OutputTokens {
-							usageAcc.OutputTokens = chunk.UsageMetadata.CandidatesTokenCount
-						}
-					}
-					for _, cand := range chunk.Candidates {
-						for _, part := range cand.Content.Parts {
-							if part.Text != "" && textSink != nil {
-								textSink(part.Text)
-							}
-							if part.InlineData != nil && part.InlineData.Data != "" {
-								imageB64.WriteString(part.InlineData.Data)
-								if part.InlineData.MimeType != "" {
-									mimeType = part.InlineData.MimeType
-								}
-							}
-						}
-					}
+	if parsed.UsageMetadata != nil {
+		usageAcc.InputTokens = parsed.UsageMetadata.PromptTokenCount
+		usageAcc.OutputTokens = parsed.UsageMetadata.CandidatesTokenCount
+	}
+	for _, cand := range parsed.Candidates {
+		for _, part := range cand.Content.Parts {
+			if part.Text != "" && textSink != nil {
+				textSink(part.Text)
+			}
+			if part.InlineData != nil && part.InlineData.Data != "" {
+				imageB64.WriteString(part.InlineData.Data)
+				if part.InlineData.MimeType != "" {
+					mimeType = part.InlineData.MimeType
 				}
 			}
-		}
-
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
-				return nil, context.DeadlineExceeded
-			}
-			return nil, fmt.Errorf("stream read failed: %w", readErr)
 		}
 	}
 
 	if imageB64.Len() == 0 {
+		slog.Error("gemini returned no image data", "model", model, "raw_response", rawResponse)
 		return nil, fmt.Errorf("no image data returned")
 	}
 
@@ -206,7 +188,7 @@ type geminiInlineIn struct {
 	Data     string `json:"data"`
 }
 
-type geminiChunk struct {
+type geminiGenerateResponse struct {
 	Candidates []struct {
 		Content struct {
 			Parts []geminiPart `json:"parts"`
