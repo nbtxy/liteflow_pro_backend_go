@@ -21,14 +21,32 @@ const (
 	EventArtifactUpdate    EventType = "artifact_updated"
 	EventError             EventType = "error"
 	EventSystemNotice      EventType = "system_notice"
+	EventToolProgress      EventType = "tool_progress"
 )
 
 func NewEvent(typ EventType, data map[string]any) Event {
 	return events.NewEvent(typ, data)
 }
 
+// TextDeltaEvent emits an LLM streaming token. It must NOT be used for tool
+// progress narration — tools should use ToolProgressEvent instead, otherwise
+// narration text gets concatenated into the assistant message body on the
+// frontend and may accumulate visually if the agent loop re-executes the tool.
 func TextDeltaEvent(content string) Event {
 	return NewEvent(EventTextDelta, map[string]any{"content": content})
+}
+
+// ToolProgressEvent emits a non-token-stream progress update from inside a
+// running tool (e.g. "preparing references", "calling model"). The frontend
+// renders it on the corresponding tool_use card, not in the assistant text.
+// toolUseID may be empty if the tool cannot determine it; in that case the
+// frontend will fall back to matching by toolName.
+func ToolProgressEvent(toolUseID, toolName, content string) Event {
+	return NewEvent(EventToolProgress, map[string]any{
+		"toolUseId": toolUseID,
+		"toolName":  toolName,
+		"content":   content,
+	})
 }
 
 func ToolUseStartEvent(toolUseID, toolName string) Event {

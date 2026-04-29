@@ -937,6 +937,37 @@ func (s *Service) streamAgentEvents(
 				"status":    status,
 				"content":   content,
 			})
+		case agent.EventToolProgress:
+			toolUseID, _ := ev.Data["toolUseId"].(string)
+			toolName, _ := ev.Data["toolName"].(string)
+			progress, _ := ev.Data["content"].(string)
+			if progress == "" {
+				break
+			}
+			if toolUseID != "" {
+				if tc, ok := toolUseIndex[toolUseID]; ok {
+					tc["progress"] = progress
+					break
+				}
+			}
+			for i := len(contentParts) - 1; i >= 0; i-- {
+				part := contentParts[i]
+				if mapString(part, "type") != "tool_use" {
+					continue
+				}
+				toolCall, ok := part["toolCall"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if mapString(toolCall, "status") != "running" {
+					continue
+				}
+				if toolName != "" && mapString(toolCall, "toolName") != toolName {
+					continue
+				}
+				toolCall["progress"] = progress
+				break
+			}
 		case agent.EventDelegationStart:
 			contentParts = append(contentParts, map[string]any{
 				"type":         "delegation_start",

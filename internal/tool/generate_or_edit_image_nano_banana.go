@@ -98,7 +98,7 @@ func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, t
 		return &ToolResult{Content: fmt.Sprintf("image provider unavailable: %s", selectedProviderName), IsError: true}, nil
 	}
 
-	t.emitNarration(ctx, "已接收图像任务，开始准备输入...")
+	t.emitNarration(ctx, tc, "已接收图像任务，开始准备输入...")
 	referenceImages := make([]imagegen.InputImage, 0, 4)
 	if refs, ok := input["reference_image_paths"]; ok {
 		for _, filePath := range toStringSlice(refs) {
@@ -113,7 +113,7 @@ func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, t
 			referenceImages = append(referenceImages, ref)
 		}
 	}
-	t.emitNarration(ctx, "参考图已就绪，正在请求模型生成...")
+	t.emitNarration(ctx, tc, "参考图已就绪，正在请求模型生成...")
 
 	providerReq := &imagegen.Request{
 		Prompt:          prompt,
@@ -130,7 +130,6 @@ func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, t
 	resp, err := selectedProvider.Generate(ctx, providerReq, func(delta string) {
 		events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
 			"content": delta,
-			"source":  "tool:" + t.toolName,
 		}))
 	})
 	if err != nil {
@@ -158,37 +157,37 @@ func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, t
 	if err != nil {
 		return &ToolResult{Content: fmt.Sprintf("create artifact failed: %v", err), IsError: true}, nil
 	}
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
 	t.recordToolUsage(ctx, tc, resp.Usage)
 
 	const presignExpireMinutes = 60
 	signedURL, signErr, usedOSS := t.presignedURLForGeneratedImage(ctx, tc.ConversationID.String(), filename, imageBytes, presignExpireMinutes)
-	content := fmt.Sprintf("图像已生成: %s (%d bytes)", filename, len(imageBytes))
+	metadata["provider"] = selectedProvider.Name()
+	metadata["model"] = selectedModel
+
+	content := fmt.Sprintf(
+		"SUCCESS: image generated and saved as %s (%d bytes). The image is delivered to the user automatically. Do not call this tool again unless the user asks for changes.",
+		filename,
+		len(imageBytes),
+	)
 	if signErr != nil {
 		slog.Warn("generate presigned url failed", "path", filename, "usedOSS", usedOSS, "err", signErr)
 	} else {
 		expiresAt := time.Now().Add(presignExpireMinutes * time.Minute)
-		metadata["provider"] = selectedProvider.Name()
-		metadata["model"] = selectedModel
 		metadata["oss_url"] = signedURL
+		metadata["download_url"] = signedURL
 		metadata["oss_url_expires_at"] = expiresAt.Format(time.RFC3339)
 		metadata["oss_url_expires_in_minutes"] = presignExpireMinutes
+		metadata["download_url_expires_at"] = expiresAt.Format(time.RFC3339)
+		metadata["download_url_expires_in_minutes"] = presignExpireMinutes
 		if usedOSS {
 			metadata["oss_link_source"] = "aliyun_oss"
+			metadata["download_url_label"] = "OSS 临时链接"
+		} else {
+			metadata["download_url_label"] = "临时链接"
 		}
-		linkLabel := "临时链接"
-		if usedOSS {
-			linkLabel = "OSS 临时链接"
-		}
-		downloadLink := fmt.Sprintf("[%s](%s)", filename, signedURL)
-		content = fmt.Sprintf(
-			"图像已生成: %s (%d bytes)\n%s: %s\n链接有效期: %d 分钟（有效期至 %s）",
-			filename,
-			len(imageBytes),
-			linkLabel,
-			downloadLink,
-			presignExpireMinutes,
-			expiresAt.Local().Format("2006-01-02 15:04:05 MST"),
-		)
 	}
 
 	return &ToolResult{
@@ -214,10 +213,15 @@ func (t *imageGenerateBase) presignedURLForGeneratedImage(ctx context.Context, c
 	return u, err, false
 }
 
-func (t *imageGenerateBase) emitNarration(ctx context.Context, content string) {
-	events.Emit(ctx, events.NewEvent("text_delta", map[string]any{
-		"content": content,
-		"source":  "tool:" + t.toolName,
+func (t *imageGenerateBase) emitNarration(ctx context.Context, tc *ToolContext, content string) {
+	toolUseID := ""
+	if tc != nil {
+		toolUseID = tc.ToolUseID
+	}
+	events.Emit(ctx, events.NewEvent("tool_progress", map[string]any{
+		"toolUseId": toolUseID,
+		"toolName":  t.toolName,
+		"content":   content,
 	}))
 }
 

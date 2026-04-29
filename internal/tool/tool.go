@@ -18,6 +18,7 @@ type ToolContext struct {
 	ConversationID uuid.UUID
 	MessageID      uuid.UUID
 	UserID         uuid.UUID
+	ToolUseID      string
 }
 
 // Tool is the interface that all tools must implement.

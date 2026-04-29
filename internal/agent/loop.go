@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ const (
 	GenerateImageToolTimeout = 300 * time.Second
 	LLMIterationTimeout      = 180 * time.Second
 	MaxToolResult            = 200000
+	MaxSameCallRepeat        = 3
 )
 
 type McpExecutorBuilder func(ctx context.Context, userID string, displayNames []string, allowedChannelNames []string) ([]tool.Tool, error)
@@ -106,6 +109,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 	if opts != nil && opts.MaxTurns > 0 && opts.MaxTurns < MaxIterations {
 		maxTurns = opts.MaxTurns
 	}
+	toolCallCounter := make(map[string]int, 16)
 	for iteration := 0; iteration < maxTurns; iteration++ {
 		if ctx.Err() != nil {
 			return
@@ -161,6 +165,25 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		nextMcpMode := mcpModeActive
 
 		for _, tc := range toolCalls {
+			repeatKey := toolCallRepeatKey(tc.name, tc.arguments)
+			toolCallCounter[repeatKey]++
+			if toolCallCounter[repeatKey] > MaxSameCallRepeat {
+				slog.Warn("tool repeat guard triggered",
+					"toolName", tc.name,
+					"repeat", toolCallCounter[repeatKey],
+					"maxRepeat", MaxSameCallRepeat,
+				)
+				events <- SystemNoticeEvent("检测到工具被重复调用，已自动停止以避免循环：" + tc.name)
+				events <- ToolResultEvent(tc.id, "error", "tool re-call limit reached", nil)
+				req.Messages = append(req.Messages, llm.LlmMessage{
+					Role:       "tool",
+					Content:    "tool re-call limit reached",
+					ToolCallID: tc.id,
+					Name:       tc.name,
+				})
+				continue
+			}
+
 			toolResultMsg, result := a.executeOneToolCallWithResult(ctx, tc, toolCtx, activatedMcpTools, opts, func(ev Event) {
 				events <- ev
 			})
@@ -398,8 +421,14 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 		defer cancel()
 		execCtx = WithEventSink(execCtx, emit)
 
+		// Per-call ToolContext copy so tools can access the tool_use_id of the
+		// current invocation (e.g. to emit ToolProgressEvent that the frontend
+		// can route to the correct tool_use card).
+		tcCopy := *toolCtx
+		tcCopy.ToolUseID = tc.id
+
 		var err error
-		result, err = t.Execute(execCtx, input, toolCtx)
+		result, err = t.Execute(execCtx, input, &tcCopy)
 		if err != nil {
 			slog.Error("tool execution failed", "toolName", tc.name, "err", err)
 			result = &tool.ToolResult{Content: "工具执行失败: " + err.Error(), IsError: true}
@@ -535,6 +564,11 @@ func parseStringSlice(v any) []string {
 		}
 	}
 	return result
+}
+
+func toolCallRepeatKey(toolName, arguments string) string {
+	sum := sha256.Sum256([]byte(arguments))
+	return toolName + "|" + hex.EncodeToString(sum[:8])
 }
 
 func toolTimeout(toolName string) time.Duration {
