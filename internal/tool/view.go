@@ -1,9 +1,12 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -84,9 +87,60 @@ func (t *ViewTool) readFile(ctx context.Context, pathOrName string, tc *ToolCont
 		return &ToolResult{Content: fmt.Sprintf("读取文件失败: %v", err), IsError: true}, nil
 	}
 
+	if isBinaryFile(resolvedPath, data) {
+		mimeType := http.DetectContentType(data)
+		size := len(data)
+		return &ToolResult{
+			Content: fmt.Sprintf(
+				"文件路径: %s\n文件大小: %d bytes\n文件类型: %s\n\n该文件为二进制文件，view 工具暂不支持直接读取实际内容。请使用下载、预览或专用解析工具查看。",
+				resolvedPath,
+				size,
+				mimeType,
+			),
+		}, nil
+	}
+
 	content := string(data)
 
 	return &ToolResult{Content: content}, nil
+}
+
+func isBinaryFile(filePath string, data []byte) bool {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff",
+		".pdf", ".zip", ".gz", ".tar", ".7z", ".rar",
+		".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac",
+		".mp4", ".mov", ".avi", ".mkv", ".webm",
+		".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".bin", ".exe", ".so", ".dylib", ".dll":
+		return true
+	}
+
+	if len(data) == 0 {
+		return false
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return true
+	}
+
+	sniffLen := len(data)
+	if sniffLen > 512 {
+		sniffLen = 512
+	}
+	mimeType := http.DetectContentType(data[:sniffLen])
+	if strings.HasPrefix(mimeType, "text/") {
+		return false
+	}
+	switch {
+	case strings.Contains(mimeType, "json"),
+		strings.Contains(mimeType, "xml"),
+		strings.Contains(mimeType, "javascript"),
+		strings.Contains(mimeType, "yaml"),
+		strings.Contains(mimeType, "x-shellscript"):
+		return false
+	}
+	return true
 }
 
 func (t *ViewTool) resolveFilePath(ctx context.Context, pathOrName string, tc *ToolContext) (string, error) {
