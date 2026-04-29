@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -273,6 +275,17 @@ func (h *ArtifactHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		InternalError(w, "failed to read file")
+		return
+	}
+
+	sum := sha1.Sum(content)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	w.Header().Set("Vary", "Authorization")
+
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
