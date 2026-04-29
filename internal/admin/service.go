@@ -24,6 +24,12 @@ type UserSummary struct {
 	MessageCount      int `json:"messageCount"`
 }
 
+type FeedbackSummary struct {
+	domain.Feedback
+	UserPhone string  `json:"userPhone"`
+	UserName  *string `json:"userName,omitempty"`
+}
+
 func (s *Service) ListUsers(ctx context.Context, limit, offset int) ([]UserSummary, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT u.id, u.phone, u.name, u.is_admin, u.settings, u.created_at, u.updated_at,
@@ -76,6 +82,43 @@ func (s *Service) SetAdmin(ctx context.Context, userID uuid.UUID, isAdmin bool) 
 		`UPDATE users SET is_admin = $1, updated_at = $2 WHERE id = $3`,
 		isAdmin, time.Now(), userID)
 	return err
+}
+
+func (s *Service) ListFeedbacks(ctx context.Context, limit, offset int) ([]FeedbackSummary, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT f.id, f.user_id, f.conversation_id, f.message_id, f.rating, f.reasons, f.comment, f.context, f.created_at,
+		        u.phone, u.name
+		 FROM feedbacks f
+		 JOIN users u ON u.id = f.user_id
+		 ORDER BY f.created_at DESC
+		 LIMIT $1 OFFSET $2`,
+		limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list feedbacks: %w", err)
+	}
+	defer rows.Close()
+
+	feedbacks := make([]FeedbackSummary, 0, limit)
+	for rows.Next() {
+		var item FeedbackSummary
+		if err := rows.Scan(
+			&item.ID,
+			&item.UserID,
+			&item.ConversationID,
+			&item.MessageID,
+			&item.Rating,
+			&item.Reasons,
+			&item.Comment,
+			&item.Context,
+			&item.CreatedAt,
+			&item.UserPhone,
+			&item.UserName,
+		); err != nil {
+			return nil, fmt.Errorf("scan feedback: %w", err)
+		}
+		feedbacks = append(feedbacks, item)
+	}
+	return feedbacks, nil
 }
 
 func (s *Service) DeleteUser(ctx context.Context, userID uuid.UUID) error {

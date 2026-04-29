@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/liteflow/backend/internal/admin"
@@ -31,6 +32,28 @@ func (h *AdminHandler) GetStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	OK(w, stats)
+}
+
+func (h *AdminHandler) ListFeedbacks(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	feedbacks, err := h.adminSvc.ListFeedbacks(r.Context(), limit, offset)
+	if err != nil {
+		InternalError(w, "failed to list feedbacks")
+		return
+	}
+	OK(w, feedbacks)
 }
 
 func (h *AdminHandler) SetAdmin(w http.ResponseWriter, r *http.Request) {

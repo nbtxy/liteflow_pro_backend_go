@@ -134,6 +134,7 @@ func NewRouter(app *App) http.Handler {
 	// Admin
 	mux.HandleFunc("GET /api/admin/users", app.AdminHandler.ListUsers)
 	mux.HandleFunc("GET /api/admin/stats", app.AdminHandler.GetStats)
+	mux.HandleFunc("GET /api/admin/feedbacks", app.AdminHandler.ListFeedbacks)
 	mux.HandleFunc("POST /api/admin/set-admin", app.AdminHandler.SetAdmin)
 	mux.HandleFunc("DELETE /api/admin/users/{id}", app.AdminHandler.DeleteUser)
 

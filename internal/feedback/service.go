@@ -27,7 +27,7 @@ func (s *Service) Create(ctx context.Context, fb *domain.Feedback) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO feedbacks (id, user_id, conversation_id, message_id, rating, reasons, comment, context, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		 ON CONFLICT ON CONSTRAINT feedbacks_user_id_message_id_key
+		 ON CONFLICT (message_id)
 		 DO UPDATE SET rating = $5, reasons = $6, comment = $7, context = $8`,
 		fb.ID, fb.UserID, fb.ConversationID, fb.MessageID, fb.Rating,
 		fb.Reasons, fb.Comment, fb.Context, fb.CreatedAt)
