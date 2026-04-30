@@ -237,7 +237,17 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 		MessageID:      assistantMsgID,
 		UserID:         userID,
 	}
-	runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
+	runResult := s.streamAgentEvents(
+		ctx,
+		llmReq,
+		toolCtx,
+		usageAcc,
+		rt,
+		currentMcpState,
+		conv.ID.String(),
+		assistantMsgID.String(),
+		events,
+	)
 	contentParts = runResult.contentParts
 	if hasTools {
 		if err := s.convSvc.SetMCPState(ctx, conv.ID, userID, currentMcpState); err != nil {
@@ -635,7 +645,17 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 			MessageID:      newMsgID,
 			UserID:         userID,
 		}
-		runResult := s.streamAgentEvents(ctx, llmReq, toolCtx, usageAcc, rt, currentMcpState, events)
+		runResult := s.streamAgentEvents(
+			ctx,
+			llmReq,
+			toolCtx,
+			usageAcc,
+			rt,
+			currentMcpState,
+			convID.String(),
+			newMsgID.String(),
+			events,
+		)
 		contentParts = runResult.contentParts
 		if hasTools {
 			if err := s.convSvc.SetMCPState(ctx, convID, userID, currentMcpState); err != nil {
@@ -716,6 +736,8 @@ func (s *Service) streamAgentEvents(
 	usageAcc *llm.LlmUsage,
 	rt *agent_profile.AgentRuntime,
 	currentMcpState *conversation.MCPState,
+	conversationID string,
+	userMessageID string,
 	events chan<- agent.Event,
 ) agentStreamRunResult {
 	toolPool, allowedMcpChannelNames := s.resolveRuntimeToolExecution(rt)
@@ -731,6 +753,8 @@ func (s *Service) streamAgentEvents(
 		ToolPool:               toolPool,
 		AllowedMcpChannelNames: allowedMcpChannelNames,
 		AgentRuntime:           rt,
+		ConversationID:         conversationID,
+		UserMessageID:          userMessageID,
 	}) {
 		switch ev.Type {
 		case agent.EventTextDelta:

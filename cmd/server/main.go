@@ -91,17 +91,25 @@ func main() {
 
 	// LLM Providers
 	providerRouter := llm.NewProviderRouter(cfg.LLM.DefaultProvider)
+	recordMode := llm.ParseRecordMode(os.Getenv("LLM_RECORD_MODE"))
+	fixtureDir := llm.DefaultFixtureDir()
+	wrapProvider := func(p llm.Provider) llm.Provider {
+		if recordMode == llm.ModeOff {
+			return p
+		}
+		return llm.NewRecordingProvider(p, fixtureDir, recordMode)
+	}
 	if cfg.LLM.DeepSeek.APIKey != "" {
-		providerRouter.Register(llm.NewDeepSeekProvider(cfg.LLM.DeepSeek))
+		providerRouter.Register(wrapProvider(llm.NewDeepSeekProvider(cfg.LLM.DeepSeek)))
 	}
 	if cfg.LLM.Qwen.APIKey != "" {
-		providerRouter.Register(llm.NewQwenProvider(cfg.LLM.Qwen))
+		providerRouter.Register(wrapProvider(llm.NewQwenProvider(cfg.LLM.Qwen)))
 	}
 	if cfg.LLM.OpenRouter.APIKey != "" {
-		providerRouter.Register(llm.NewOpenRouterProvider(cfg.LLM.OpenRouter))
+		providerRouter.Register(wrapProvider(llm.NewOpenRouterProvider(cfg.LLM.OpenRouter)))
 	}
 	if cfg.LLM.Cloudflare.Endpoint != "" {
-		providerRouter.Register(llm.NewCloudflareProvider(cfg.LLM.Cloudflare))
+		providerRouter.Register(wrapProvider(llm.NewCloudflareProvider(cfg.LLM.Cloudflare)))
 	}
 
 	// Image Generation Providers

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -34,6 +35,8 @@ type ExecuteOptions struct {
 	ToolPool               map[string]tool.Tool
 	AllowedMcpChannelNames []string
 	AgentRuntime           *agent_profile.AgentRuntime
+	ConversationID         string
+	UserMessageID          string
 	MaxTurns               int
 }
 
@@ -117,7 +120,23 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 
 		slog.Info("agent loop iteration start", "iteration", iteration)
 
-		accumulators, iterContent, err := a.streamLLMResponse(ctx, req, usageAcc, events, opts)
+		llmCtx := ctx
+		if opts != nil && strings.TrimSpace(opts.ConversationID) != "" && strings.TrimSpace(opts.UserMessageID) != "" {
+			callCtx := llm.CallContext{
+				ConversationID: strings.TrimSpace(opts.ConversationID),
+				UserMessageID:  strings.TrimSpace(opts.UserMessageID),
+				CallSeq:        iteration,
+			}
+			if llm.IsReplayMode(llm.ParseRecordMode(os.Getenv("LLM_RECORD_MODE"))) {
+				if convID, msgID, ok := llm.ReplayForceIDsForMode(llm.ParseRecordMode(os.Getenv("LLM_RECORD_MODE"))); ok {
+					callCtx.ConversationID = convID
+					callCtx.UserMessageID = msgID
+				}
+			}
+			llmCtx = llm.WithCallContext(ctx, callCtx)
+		}
+
+		accumulators, iterContent, err := a.streamLLMResponse(llmCtx, req, usageAcc, events, opts)
 		if err != nil {
 			if llm.IsContextExceeded(err) && a.compactor != nil {
 				slog.Warn("context exceeded, compacting and retrying once", "iteration", iteration)
@@ -128,7 +147,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 				}
 				req.Messages = newMsgs
 				events <- SystemNoticeEvent("对话历史已自动压缩，继续响应中...")
-				accumulators, iterContent, err = a.streamLLMResponse(ctx, req, usageAcc, events, opts)
+				accumulators, iterContent, err = a.streamLLMResponse(llmCtx, req, usageAcc, events, opts)
 				if err != nil {
 					events <- ErrorEvent("context_exceeded", "压缩后仍超限，请开启新会话: "+err.Error())
 					return
@@ -164,7 +183,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 		var newlyActivated []string
 		nextMcpMode := mcpModeActive
 
-		for _, tc := range toolCalls {
+		for toolSeq, tc := range toolCalls {
 			repeatKey := toolCallRepeatKey(tc.name, tc.arguments)
 			toolCallCounter[repeatKey]++
 			if toolCallCounter[repeatKey] > MaxSameCallRepeat {
@@ -184,7 +203,7 @@ func (a *AgentLoop) run(ctx context.Context, req *llm.LlmRequest,
 				continue
 			}
 
-			toolResultMsg, result := a.executeOneToolCallWithResult(ctx, tc, toolCtx, activatedMcpTools, opts, func(ev Event) {
+			toolResultMsg, result := a.executeOneToolCallWithResult(llmCtx, tc, toolSeq, toolCtx, activatedMcpTools, opts, func(ev Event) {
 				events <- ev
 			})
 			req.Messages = append(req.Messages, toolResultMsg)
@@ -366,7 +385,7 @@ func toToolCallSlice(calls []toolCallInfo) []llm.ToolCall {
 	return result
 }
 
-func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCallInfo,
+func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCallInfo, toolSeq int,
 	toolCtx *tool.ToolContext, mcpTools map[string]tool.Tool, opts *ExecuteOptions, emit func(Event)) (llm.LlmMessage, *tool.ToolResult) {
 
 	slog.Info("tool executing",
@@ -406,36 +425,54 @@ func (a *AgentLoop) executeOneToolCallWithResult(ctx context.Context, tc toolCal
 	}
 
 	var result *tool.ToolResult
+	replayed := false
 	startMs := time.Now()
-
-	if t == nil {
-		slog.Warn("tool not found", "toolName", tc.name)
-		result = &tool.ToolResult{Content: "工具不存在: " + tc.name, IsError: true}
-	} else if argsParseErr != nil {
-		result = &tool.ToolResult{
-			Content: fmt.Sprintf("工具参数不是合法 JSON，请重试并输出完整参数。parse error: %v", argsParseErr),
-			IsError: true,
+	if argsParseErr == nil {
+		if fixture, ok, replayErr := loadToolFixture(ctx, toolSeq, tc.id, tc.name); replayErr != nil {
+			slog.Error("tool replay failed", "toolName", tc.name, "err", replayErr)
+			result = &tool.ToolResult{Content: "工具回放失败: " + replayErr.Error(), IsError: true}
+		} else if ok && fixture != nil && fixture.Result != nil {
+			replayed = true
+			result = fixture.Result
 		}
-	} else {
-		execCtx, cancel := context.WithTimeout(ctx, toolTimeout(tc.name))
-		defer cancel()
-		execCtx = WithEventSink(execCtx, emit)
+	}
 
-		// Per-call ToolContext copy so tools can access the tool_use_id of the
-		// current invocation (e.g. to emit ToolProgressEvent that the frontend
-		// can route to the correct tool_use card).
-		tcCopy := *toolCtx
-		tcCopy.ToolUseID = tc.id
+	if result == nil {
+		if t == nil {
+			slog.Warn("tool not found", "toolName", tc.name)
+			result = &tool.ToolResult{Content: "工具不存在: " + tc.name, IsError: true}
+		} else if argsParseErr != nil {
+			result = &tool.ToolResult{
+				Content: fmt.Sprintf("工具参数不是合法 JSON，请重试并输出完整参数。parse error: %v", argsParseErr),
+				IsError: true,
+			}
+		} else {
+			execCtx, cancel := context.WithTimeout(ctx, toolTimeout(tc.name))
+			defer cancel()
+			execCtx = WithEventSink(execCtx, emit)
 
-		var err error
-		result, err = t.Execute(execCtx, input, &tcCopy)
-		if err != nil {
-			slog.Error("tool execution failed", "toolName", tc.name, "err", err)
-			result = &tool.ToolResult{Content: "工具执行失败: " + err.Error(), IsError: true}
+			// Per-call ToolContext copy so tools can access the tool_use_id of the
+			// current invocation (e.g. to emit ToolProgressEvent that the frontend
+			// can route to the correct tool_use card).
+			tcCopy := *toolCtx
+			tcCopy.ToolUseID = tc.id
+
+			var err error
+			result, err = t.Execute(execCtx, input, &tcCopy)
+			if err != nil {
+				slog.Error("tool execution failed", "toolName", tc.name, "err", err)
+				result = &tool.ToolResult{Content: "工具执行失败: " + err.Error(), IsError: true}
+			}
 		}
 	}
 
 	durationMs := time.Since(startMs).Milliseconds()
+	mode := toolReplayControlFromEnv()
+	if shouldRecordToolFixture(mode, replayed) {
+		if err := saveToolFixture(ctx, toolSeq, tc, input, result, durationMs); err != nil {
+			slog.Warn("failed to save tool replay fixture", "toolName", tc.name, "err", err)
+		}
+	}
 	status := "success"
 	if result.IsError {
 		status = "error"
