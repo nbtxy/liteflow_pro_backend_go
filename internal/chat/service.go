@@ -3,7 +3,6 @@ package chat
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -56,9 +55,6 @@ func NewService(
 		userSvc:        userSvc,
 		memorySvc:      memorySvc,
 		usageSvc:       usageSvc,
-	}
-	if agentSvc != nil {
-		agentSvc.SetDelegateRunner(svc.runSubAgent)
 	}
 	return svc
 }
@@ -292,150 +288,6 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 			"output_tokens": usageAcc.OutputTokens,
 		},
 	})
-}
-
-func (s *Service) runSubAgent(ctx context.Context, subAgentID, subAgentName, taskText, extraContext string, parentTC *tool.ToolContext) (string, error) {
-	if s.agentSvc == nil {
-		return "", nil
-	}
-	agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationStart, map[string]any{
-		"subAgentId":   subAgentID,
-		"subAgentName": subAgentName,
-		"task":         taskText,
-	}))
-
-	rt, err := s.agentSvc.Resolve(ctx, subAgentID)
-	if err != nil {
-		return "", err
-	}
-	if parentTC != nil {
-		s.applyUserToolAccess(ctx, rt, parentTC.UserID)
-	}
-	if rt == nil || rt.Provider == nil {
-		return "", nil
-	}
-	var subAgentRef *string
-	if strings.TrimSpace(rt.AgentID) != "" {
-		id := rt.AgentID
-		subAgentRef = &id
-	}
-	var parentMessageID *uuid.UUID
-	if parentTC != nil && parentTC.MessageID != uuid.Nil {
-		pid := parentTC.MessageID
-		parentMessageID = &pid
-	}
-
-	var prompt strings.Builder
-	prompt.WriteString("任务：\n")
-	prompt.WriteString(taskText)
-	if strings.TrimSpace(extraContext) != "" {
-		prompt.WriteString("\n\n额外上下文：\n")
-		prompt.WriteString(strings.TrimSpace(extraContext))
-	}
-
-	conversationID := ""
-	if parentTC != nil && parentTC.ConversationID != uuid.Nil {
-		conversationID = parentTC.ConversationID.String()
-	}
-	inputMsg := domain.Message{
-		ID:              uuid.New(),
-		Role:            "user",
-		SenderType:      "agent",
-		AgentID:         subAgentRef,
-		CreatedAt:       time.Now(),
-		ParentMessageID: parentMessageID,
-		IsInternal:      true,
-	}
-	if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": prompt.String()}}); err == nil {
-		inputMsg.ContentParts = parts
-	}
-	if parentTC != nil && parentTC.ConversationID != uuid.Nil {
-		inputMsg.ConversationID = parentTC.ConversationID
-		if s.convSvc != nil {
-			_ = s.convSvc.SaveMessage(ctx, &inputMsg)
-		}
-	}
-	subAgentUserID := ""
-	if parentTC != nil && parentTC.UserID != uuid.Nil {
-		subAgentUserID = parentTC.UserID.String()
-	}
-	subAgentUserName := "Developer"
-	if subAgentUserID != "" {
-		if parsedID, parseErr := uuid.Parse(subAgentUserID); parseErr == nil {
-			subAgentUserName = s.resolvePromptUserName(ctx, parsedID)
-		}
-	}
-	subAgentMemoryContext := ""
-	if parentTC != nil && parentTC.UserID != uuid.Nil {
-		subAgentMemoryContext = s.buildMemoryContext(ctx, parentTC.UserID)
-	}
-	llmReq := s.contextAsm.Assemble(ctx, []domain.Message{inputMsg}, conversationID, subAgentMemoryContext, "", &llm.AssembleOptions{
-		Provider:             rt.Provider,
-		ToolDefs:             rt.ToolDefs,
-		PromptModules:        rt.PromptModules,
-		SystemPromptOverride: rt.SystemPromptOverride,
-		UserName:             subAgentUserName,
-		Temperature:          rt.Temperature,
-		MaxTokens:            rt.MaxTokens,
-		Model:                rt.Model,
-	})
-
-	toolCtx := &tool.ToolContext{}
-	if parentTC != nil {
-		toolCtx.ConversationID = parentTC.ConversationID
-		toolCtx.UserID = parentTC.UserID
-		toolCtx.MessageID = parentTC.MessageID
-	}
-
-	usageAcc := &llm.LlmUsage{}
-	subEvents := s.agentLoop.Execute(ctx, llmReq, toolCtx, usageAcc, &agent.ExecuteOptions{
-		ToolPool:               rt.EnabledToolSet,
-		AllowedMcpChannelNames: rt.EnabledMcpChannelNames,
-		AgentRuntime:           rt,
-		MaxTurns:               20,
-	})
-
-	var out strings.Builder
-	for ev := range subEvents {
-		switch ev.Type {
-		case agent.EventTextDelta:
-			if c, ok := ev.Data["content"].(string); ok {
-				out.WriteString(c)
-				agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationDelta, map[string]any{
-					"subAgentId":   subAgentID,
-					"subAgentName": subAgentName,
-					"content":      c,
-				}))
-			}
-		case agent.EventError:
-			msg, _ := ev.Data["message"].(string)
-			return "", errors.New(msg)
-		}
-	}
-
-	result := strings.TrimSpace(out.String())
-	if s.convSvc != nil && parentTC != nil && parentTC.ConversationID != uuid.Nil {
-		internalResult := &domain.Message{
-			ID:              uuid.New(),
-			ConversationID:  parentTC.ConversationID,
-			Role:            "assistant",
-			SenderType:      "agent",
-			AgentID:         subAgentRef,
-			CreatedAt:       time.Now(),
-			ParentMessageID: parentMessageID,
-			IsInternal:      true,
-		}
-		if parts, err := json.Marshal([]map[string]any{{"type": "text", "text": result}}); err == nil {
-			internalResult.ContentParts = parts
-		}
-		_ = s.convSvc.SaveMessage(ctx, internalResult)
-	}
-	agent.EmitFromContext(ctx, agent.NewEvent(agent.EventDelegationEnd, map[string]any{
-		"subAgentId":   subAgentID,
-		"subAgentName": subAgentName,
-		"result":       result,
-	}))
-	return result, nil
 }
 
 func (s *Service) generateTitleIfNeeded(conv *domain.Conversation, firstMessage string, userID uuid.UUID) {
@@ -977,27 +829,6 @@ func (s *Service) streamAgentEvents(
 				toolCall["progress"] = progress
 				break
 			}
-		case agent.EventDelegationStart:
-			contentParts = append(contentParts, map[string]any{
-				"type":         "delegation_start",
-				"subAgentId":   ev.Data["subAgentId"],
-				"subAgentName": ev.Data["subAgentName"],
-				"task":         ev.Data["task"],
-			})
-		case agent.EventDelegationDelta:
-			contentParts = append(contentParts, map[string]any{
-				"type":         "delegation_delta",
-				"subAgentId":   ev.Data["subAgentId"],
-				"subAgentName": ev.Data["subAgentName"],
-				"content":      ev.Data["content"],
-			})
-		case agent.EventDelegationEnd:
-			contentParts = append(contentParts, map[string]any{
-				"type":         "delegation_end",
-				"subAgentId":   ev.Data["subAgentId"],
-				"subAgentName": ev.Data["subAgentName"],
-				"result":       ev.Data["result"],
-			})
 		case agent.EventError:
 			if code, ok := ev.Data["code"].(string); ok {
 				streamErrorCode = code
@@ -1163,26 +994,7 @@ func normalizeContentParts(parts []map[string]any) []map[string]any {
 				"type": "text",
 				"text": text,
 			})
-		case "delegation_delta":
-			content := mapString(part, "content")
-			if content == "" {
-				continue
-			}
-			subAgentID := mapString(part, "subAgentId")
-			subAgentName := mapString(part, "subAgentName")
-			if len(out) > 0 && mapString(out[len(out)-1], "type") == "delegation_delta" &&
-				mapString(out[len(out)-1], "subAgentId") == subAgentID &&
-				mapString(out[len(out)-1], "subAgentName") == subAgentName {
-				out[len(out)-1]["content"] = mapString(out[len(out)-1], "content") + content
-				continue
-			}
-			out = append(out, map[string]any{
-				"type":         "delegation_delta",
-				"subAgentId":   subAgentID,
-				"subAgentName": subAgentName,
-				"content":      content,
-			})
-		case "tool_use", "tool_result", "delegation_start", "delegation_end":
+		case "tool_use", "tool_result":
 			normalized := map[string]any{"type": typ}
 			for k, v := range part {
 				if k == "type" {

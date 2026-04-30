@@ -14,7 +14,6 @@ type Service struct {
 	registry       *AgentRegistry
 	providerRouter *llm.ProviderRouter
 	toolRegistry   *tool.Registry
-	delegateRunner tool.DelegateRunner
 }
 
 func NewService(registry *AgentRegistry, providerRouter *llm.ProviderRouter, toolRegistry *tool.Registry) *Service {
@@ -23,10 +22,6 @@ func NewService(registry *AgentRegistry, providerRouter *llm.ProviderRouter, too
 		providerRouter: providerRouter,
 		toolRegistry:   toolRegistry,
 	}
-}
-
-func (s *Service) SetDelegateRunner(runner tool.DelegateRunner) {
-	s.delegateRunner = runner
 }
 
 func (s *Service) Resolve(ctx context.Context, agentID string) (*AgentRuntime, error) {
@@ -67,26 +62,6 @@ func (s *Service) Resolve(ctx context.Context, agentID string) (*AgentRuntime, e
 
 	rt.EnabledToolSet = s.buildToolPool(selected.EnabledBuiltinTools)
 	rt.ToolDefs = buildToolDefs(rt.EnabledToolSet)
-
-	// if rt.AgentType == "main" && s.delegateRunner != nil {
-	// 	for _, sub := range s.registry.Subs() {
-	// 		dTool := tool.NewDelegateAgent(sub.ID, sub.Name, sub.Description, s.delegateRunner)
-	// 		rt.EnabledToolSet[dTool.Name()] = dTool
-	// 		rt.ToolDefs = append(rt.ToolDefs, llm.ToolDefinition{
-	// 			Type: "function",
-	// 			Function: llm.ToolFunction{
-	// 				Name:        dTool.Name(),
-	// 				Description: dTool.Description(),
-	// 				Parameters:  dTool.InputSchema(),
-	// 			},
-	// 		})
-	// 		rt.SubAgentTools = append(rt.SubAgentTools, dTool)
-	// 	}
-	// }
-
-	if len(rt.SubAgentTools) > 0 {
-		rt.SystemPromptOverride = strings.TrimSpace(strings.TrimSpace(rt.SystemPromptOverride) + "\n\n" + s.buildDelegationGuide(rt))
-	}
 
 	return rt, nil
 }
@@ -145,22 +120,6 @@ func buildToolDefs(pool map[string]tool.Tool) []llm.ToolDefinition {
 		})
 	}
 	return defs
-}
-
-func (s *Service) buildDelegationGuide(rt *AgentRuntime) string {
-	var b strings.Builder
-	b.WriteString("## 任务委派\n")
-	b.WriteString("你可以将特定子任务委派给以下专业助手：\n")
-	for _, subTool := range rt.SubAgentTools {
-		b.WriteString("- ")
-		b.WriteString(subTool.Name())
-		b.WriteString(": ")
-		b.WriteString(subTool.Description())
-		b.WriteString("\n")
-	}
-	b.WriteString("\n对于简单问答、闲聊、简短解释，你直接回答。")
-	b.WriteString("对于涉及专业领域输出的任务，委派给合适的专业助手处理，然后综合结果给用户一个完整回答。")
-	return b.String()
 }
 
 func cloneStrings(items []string) []string {

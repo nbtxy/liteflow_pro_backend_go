@@ -20,5 +20,4 @@ type AgentRuntime struct {
 	SystemPromptOverride   string
 	Temperature            *float64
 	MaxTokens              int
-	SubAgentTools          []*tool.DelegateAgent
 }
