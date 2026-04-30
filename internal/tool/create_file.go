@@ -14,6 +14,7 @@ type CreateFileArtifactFunc func(ctx context.Context, conversationID, messageID 
 
 type CreateImageArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path string, data []byte, mimeType string) (map[string]any, error)
 type CreateVideoArtifactFunc func(ctx context.Context, conversationID, messageID uuid.UUID, path string, data []byte, mimeType string) (map[string]any, error)
+type UpdateArtifactMetadataFunc func(ctx context.Context, artifactID uuid.UUID, patch map[string]any) error
 
 type CreateFileTool struct {
 	storageSvc     storage.Service

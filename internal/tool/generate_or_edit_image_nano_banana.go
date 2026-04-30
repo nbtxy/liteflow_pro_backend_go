@@ -19,16 +19,17 @@ import (
 type RecordToolUsageFunc func(ctx context.Context, userID, conversationID, messageID uuid.UUID, usage *llm.LlmUsage)
 
 type imageGenerateBase struct {
-	storageSvc       storage.Service
-	ossLinkSvc       storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
-	createArtifact   CreateImageArtifactFunc
-	recordUsage      RecordToolUsageFunc
-	providerRouter   *imagegen.ProviderRouter
-	toolName         string
-	description      string
-	providerName     string
-	modelName        string
-	useReferenceURLs bool // when true, fetch reference images as OSS presigned URLs instead of downloading bytes
+	storageSvc             storage.Service
+	ossLinkSvc             storage.Service // optional: when set, public tool reply uses OSS presigned HTTPS URLs
+	createArtifact         CreateImageArtifactFunc
+	updateArtifactMetadata UpdateArtifactMetadataFunc
+	recordUsage            RecordToolUsageFunc
+	providerRouter         *imagegen.ProviderRouter
+	toolName               string
+	description            string
+	providerName           string
+	modelName              string
+	useReferenceURLs       bool // when true, fetch reference images as OSS presigned URLs instead of downloading bytes
 }
 
 func (t *imageGenerateBase) inputSchema() map[string]any {
@@ -162,33 +163,18 @@ func (t *imageGenerateBase) execute(ctx context.Context, input map[string]any, t
 	}
 	t.recordToolUsage(ctx, tc, resp.Usage)
 
-	const presignExpireMinutes = 60
-	signedURL, signErr, usedOSS := t.presignedURLForGeneratedImage(ctx, tc.ConversationID.String(), filename, imageBytes, presignExpireMinutes)
-	metadata["provider"] = selectedProvider.Name()
-	metadata["model"] = selectedModel
+	artifactMetaPatch := map[string]any{
+		"provider": selectedProvider.Name(),
+		"model":    selectedModel,
+	}
 
 	content := fmt.Sprintf(
 		"SUCCESS: image generated and saved as %s (%d bytes). The image is delivered to the user automatically. Do not call this tool again unless the user asks for changes.",
 		filename,
 		len(imageBytes),
 	)
-	if signErr != nil {
-		slog.Warn("generate presigned url failed", "path", filename, "usedOSS", usedOSS, "err", signErr)
-	} else {
-		expiresAt := time.Now().Add(presignExpireMinutes * time.Minute)
-		metadata["oss_url"] = signedURL
-		metadata["download_url"] = signedURL
-		metadata["oss_url_expires_at"] = expiresAt.Format(time.RFC3339)
-		metadata["oss_url_expires_in_minutes"] = presignExpireMinutes
-		metadata["download_url_expires_at"] = expiresAt.Format(time.RFC3339)
-		metadata["download_url_expires_in_minutes"] = presignExpireMinutes
-		if usedOSS {
-			metadata["oss_link_source"] = "aliyun_oss"
-			metadata["download_url_label"] = "OSS 临时链接"
-		} else {
-			metadata["download_url_label"] = "临时链接"
-		}
-	}
+	t.persistArtifactMetadata(ctx, metadata, artifactMetaPatch)
+	metadata = keepToolEventMetadata(metadata)
 
 	return &ToolResult{
 		Content:  content,
@@ -235,6 +221,42 @@ func (t *imageGenerateBase) recordToolUsage(ctx context.Context, tc *ToolContext
 	t.recordUsage(ctx, tc.UserID, tc.ConversationID, tc.MessageID, usage)
 }
 
+func (t *imageGenerateBase) persistArtifactMetadata(ctx context.Context, toolMetadata, patch map[string]any) {
+	if t.updateArtifactMetadata == nil || len(patch) == 0 {
+		return
+	}
+	artifactIDRaw, ok := toolMetadata["artifact_id"]
+	if !ok {
+		return
+	}
+	artifactIDStr, ok := artifactIDRaw.(string)
+	if !ok || strings.TrimSpace(artifactIDStr) == "" {
+		return
+	}
+	artifactID, err := uuid.Parse(artifactIDStr)
+	if err != nil {
+		slog.Warn("invalid artifact_id in tool metadata", "artifact_id", artifactIDStr, "err", err)
+		return
+	}
+	if err := t.updateArtifactMetadata(ctx, artifactID, patch); err != nil {
+		slog.Warn("update artifact metadata failed", "artifact_id", artifactID.String(), "err", err)
+	}
+}
+
+func keepToolEventMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return metadata
+	}
+	keys := []string{"artifact_id", "type", "title", "version", "file_size", "parent_id"}
+	result := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if v, ok := metadata[key]; ok {
+			result[key] = v
+		}
+	}
+	return result
+}
+
 func (t *imageGenerateBase) fetchReferenceImageByPath(ctx context.Context, conversationID, filePath string) (imagegen.InputImage, error) {
 	if t.useReferenceURLs && t.ossLinkSvc != nil {
 		url, err := t.ossLinkSvc.GeneratePresignedURL(ctx, conversationID, filePath, "GET", 30)
@@ -265,21 +287,23 @@ func NewNanoBananaImageGenerate(
 	storageSvc storage.Service,
 	ossLinkSvc storage.Service,
 	createArtifact CreateImageArtifactFunc,
+	updateArtifactMetadata UpdateArtifactMetadataFunc,
 	recordUsage RecordToolUsageFunc,
 	providerRouter *imagegen.ProviderRouter,
 	modelName string,
 ) *NanoBananaImageGenerateTool {
 	return &NanoBananaImageGenerateTool{
 		base: imageGenerateBase{
-			storageSvc:     storageSvc,
-			ossLinkSvc:     ossLinkSvc,
-			createArtifact: createArtifact,
-			recordUsage:    recordUsage,
-			providerRouter: providerRouter,
-			toolName:       "generate_or_edit_image_nano_banana",
-			description:    "生成或编辑图像：固定使用 Nano Banana（Cloudflare Gemini Image）模型链路；仅给 prompt 时从零生成，传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（结果以 IMAGE artifact 返回）",
-			providerName:   "cloudflare-gemini-image",
-			modelName:      strings.TrimSpace(modelName),
+			storageSvc:             storageSvc,
+			ossLinkSvc:             ossLinkSvc,
+			createArtifact:         createArtifact,
+			updateArtifactMetadata: updateArtifactMetadata,
+			recordUsage:            recordUsage,
+			providerRouter:         providerRouter,
+			toolName:               "generate_or_edit_image_nano_banana",
+			description:            "生成或编辑图像：固定使用 Nano Banana（Cloudflare Gemini Image）模型链路；仅给 prompt 时从零生成，传入 reference_image_paths 时将其作为原图进行编辑/修改/风格迁移（结果以 IMAGE artifact 返回）",
+			providerName:           "cloudflare-gemini-image",
+			modelName:              strings.TrimSpace(modelName),
 		},
 	}
 }

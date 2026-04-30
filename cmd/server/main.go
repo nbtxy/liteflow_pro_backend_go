@@ -221,6 +221,7 @@ func main() {
 			storageSvc,
 			ossLinkSvc,
 			artifactSvc.CreateImageArtifact,
+			artifactSvc.UpdateMetadataByID,
 			func(ctx context.Context, userID, conversationID, messageID uuid.UUID, tokenUsage *llm.LlmUsage) {
 				if usageSvc == nil || tokenUsage == nil || tokenUsage.TotalTokens() <= 0 {
 					return
@@ -248,6 +249,7 @@ func main() {
 			storageSvc,
 			ossLinkSvc,
 			artifactSvc.CreateImageArtifact,
+			artifactSvc.UpdateMetadataByID,
 			func(ctx context.Context, userID, conversationID, messageID uuid.UUID, tokenUsage *llm.LlmUsage) {
 				if usageSvc == nil || tokenUsage == nil || tokenUsage.TotalTokens() <= 0 {
 					return

@@ -86,6 +86,9 @@ func ToolResultEvent(toolUseID, status, content string, metadata map[string]any)
 		if sourceMessageID, ok := metadata["source_message_id"]; ok {
 			data["source_message_id"] = sourceMessageID
 		}
+		if artifactID, ok := metadata["artifact_id"]; ok {
+			data["artifactId"] = artifactID
+		}
 	}
 	return NewEvent(EventToolResult, data)
 }

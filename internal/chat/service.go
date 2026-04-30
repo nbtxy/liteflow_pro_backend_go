@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -916,6 +917,10 @@ func (s *Service) streamAgentEvents(
 			toolUseID, _ := ev.Data["toolUseId"].(string)
 			status, _ := ev.Data["status"].(string)
 			content, _ := ev.Data["content"].(string)
+			artifactID := strings.TrimSpace(fmt.Sprint(ev.Data["artifactId"]))
+			if artifactID == "<nil>" {
+				artifactID = ""
+			}
 			if mode, ok := ev.Data["mcp_mode"].(string); ok {
 				currentMcpState.Mode = mode
 				currentMcpState.ActivatedTools = parseStringSlice(ev.Data["activated_tools"])
@@ -931,12 +936,16 @@ func (s *Service) streamAgentEvents(
 					tc["duration"] = time.Now().UnixMilli() - startedAt
 				}
 			}
-			contentParts = append(contentParts, map[string]any{
+			part := map[string]any{
 				"type":      "tool_result",
 				"toolUseId": toolUseID,
 				"status":    status,
 				"content":   content,
-			})
+			}
+			if strings.TrimSpace(artifactID) != "" {
+				part["artifactId"] = artifactID
+			}
+			contentParts = append(contentParts, part)
 		case agent.EventToolProgress:
 			toolUseID, _ := ev.Data["toolUseId"].(string)
 			toolName, _ := ev.Data["toolName"].(string)

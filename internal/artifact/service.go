@@ -152,6 +152,25 @@ func (s *Service) DeleteByPath(ctx context.Context, conversationID uuid.UUID, fi
 	return err
 }
 
+func (s *Service) UpdateMetadataByID(ctx context.Context, artifactID uuid.UUID, patch map[string]any) error {
+	if artifactID == uuid.Nil || len(patch) == 0 {
+		return nil
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshal artifact metadata patch: %w", err)
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE artifacts
+		 SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+		 WHERE id = $1`,
+		artifactID, patchBytes)
+	if err != nil {
+		return fmt.Errorf("update artifact metadata: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) CreateFileArtifact(ctx context.Context, conversationID, messageID uuid.UUID,
 	path, content string) (map[string]any, error) {
 
