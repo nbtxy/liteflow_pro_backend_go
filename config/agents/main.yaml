@@ -8,6 +8,5 @@ llm:
   provider: deepseek
   model: deepseek-chat
   temperature: 0.0
-  max_tokens: 4096
 
 priority: 0

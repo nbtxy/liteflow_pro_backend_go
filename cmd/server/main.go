@@ -358,7 +358,7 @@ func main() {
 
 		AuthHandler:     api.NewAuthHandler(authSvc),
 		ChatHandler:     api.NewChatHandler(chatSvc),
-		ConvHandler:     api.NewConversationHandler(convSvc),
+		ConvHandler:     api.NewConversationHandler(convSvc, chatSvc),
 		ArtifactHandler: api.NewArtifactHandler(artifactSvc, storageSvc, stsProvider),
 		MemoryHandler:   api.NewMemoryHandler(memorySvc),
 		UserHandler:     api.NewUserHandler(userSvc),

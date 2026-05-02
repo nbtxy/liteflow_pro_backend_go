@@ -34,19 +34,25 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
 	return &SSEWriter{w: w, flusher: flusher}, nil
 }
 
-func (s *SSEWriter) SendEvent(event Event) {
+func (s *SSEWriter) SendEvent(event Event) bool {
 	data, err := json.Marshal(event.Data)
 	if err != nil {
 		slog.Error("failed to marshal SSE event", "err", err)
-		return
+		return true
 	}
 
-	fmt.Fprintf(s.w, "data: %s\n\n", data)
+	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", data); err != nil {
+		slog.Warn("failed to write SSE event", "err", err)
+		return false
+	}
 	s.flusher.Flush()
+	return true
 }
 
 func (s *SSEWriter) SendEvents(events <-chan Event) {
 	for event := range events {
-		s.SendEvent(event)
+		if ok := s.SendEvent(event); !ok {
+			return
+		}
 	}
 }

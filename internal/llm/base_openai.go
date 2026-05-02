@@ -253,11 +253,21 @@ func (p *BaseOpenAIProvider) buildRequestBody(req *LlmRequest, stream bool) map[
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
 	}
-	if req.Temperature != nil {
+	if req.Temperature != nil && supportsTemperatureParameter(model) {
 		body["temperature"] = *req.Temperature
 	}
 
 	return body
+}
+
+func supportsTemperatureParameter(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	// Cloudflare gateway rejects temperature for Claude Opus models.
+	// Keep passing temperature for other Claude families (e.g. Sonnet/Haiku).
+	if strings.Contains(m, "claude-opus") {
+		return false
+	}
+	return true
 }
 
 func (p *BaseOpenAIProvider) extractChunk(data string) (*LlmChunk, error) {

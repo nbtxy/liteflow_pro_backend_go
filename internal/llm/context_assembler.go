@@ -241,19 +241,17 @@ func buildLlmMessages(
 	storageSvc storage.Service,
 	ossLinkSvc storage.Service,
 ) []LlmMessage {
-	if msg.Role == "tool" && msg.Metadata != nil {
-		var meta domain.MessageMetadata
-		if err := json.Unmarshal(msg.Metadata, &meta); err == nil {
-			return []LlmMessage{{
-				Role:       "tool",
-				Content:    extractMessageText(msg),
-				ToolCallID: meta.ToolCallID,
-				Name:       meta.ToolName,
-			}}
-		}
+	if msg.Role == "assistant" {
+		return buildAssistantLlmMessages(msg)
 	}
+	if msg.Role == "user" {
+		return buildUserLlmMessages(msg, conversationID, visionSupported, storageSvc, ossLinkSvc)
+	}
+	return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
+}
 
-	if msg.Role == "assistant" && len(msg.ContentParts) > 0 {
+func buildAssistantLlmMessages(msg domain.Message) []LlmMessage {
+	if len(msg.ContentParts) > 0 {
 		var parts []assistantContentPart
 		if err := json.Unmarshal(msg.ContentParts, &parts); err == nil && len(parts) > 0 {
 			intermediate := buildIntermediateMessagesFromContentParts(parts)
@@ -267,8 +265,17 @@ func buildLlmMessages(
 			}
 		}
 	}
+	return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
+}
 
-	if msg.Role == "user" && msg.Metadata != nil {
+func buildUserLlmMessages(
+	msg domain.Message,
+	conversationID string,
+	visionSupported bool,
+	storageSvc storage.Service,
+	ossLinkSvc storage.Service,
+) []LlmMessage {
+	if msg.Metadata != nil {
 		var meta struct {
 			QuotedMessage *struct {
 				Role    string `json:"role"`
@@ -347,10 +354,6 @@ func buildLlmMessages(
 				return []LlmMessage{{Role: "user", Content: content}}
 			}
 		}
-	}
-
-	if msg.Role == "user" {
-		return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
 	}
 	return []LlmMessage{{Role: msg.Role, Content: extractMessageText(msg)}}
 }

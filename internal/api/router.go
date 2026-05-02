@@ -45,6 +45,7 @@ func NewRouter(app *App) http.Handler {
 
 	// Chat
 	mux.HandleFunc("POST /api/chat/stream", app.ChatHandler.Stream)
+	mux.HandleFunc("POST /api/chat/stream/stop", app.ChatHandler.StopStream)
 	mux.HandleFunc("POST /api/chat/regenerate", app.ChatHandler.Regenerate)
 
 	// Conversations

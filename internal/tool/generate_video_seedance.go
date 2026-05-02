@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/liteflow/backend/internal/config"
+	"github.com/liteflow/backend/internal/platform/events"
 	"github.com/liteflow/backend/internal/platform/storage"
 )
 
@@ -138,6 +139,7 @@ func (t *SeedanceVideoGenerateTool) Execute(ctx context.Context, input map[strin
 	if prompt == "" {
 		return &ToolResult{Content: "prompt is required", IsError: true}, nil
 	}
+	t.emitProgress(ctx, tc, "已提交视频生成请求，正在调用 Seedance...")
 
 	content := []map[string]any{
 		{"type": "text", "text": prompt},
@@ -198,11 +200,13 @@ func (t *SeedanceVideoGenerateTool) Execute(ctx context.Context, input map[strin
 		if strings.TrimSpace(taskID) == "" {
 			return &ToolResult{Content: "seedance 未返回 video_url 或 task_id", IsError: true}, nil
 		}
-		videoURL, err = t.pollVideoURL(ctx, endpoint, taskID)
+		t.emitProgress(ctx, tc, fmt.Sprintf("任务已创建（ID: %s），开始轮询生成进度...", taskID))
+		videoURL, err = t.pollVideoURL(ctx, endpoint, taskID, tc)
 		if err != nil {
 			return &ToolResult{Content: fmt.Sprintf("seedance polling failed: %v", err), IsError: true}, nil
 		}
 	}
+	t.emitProgress(ctx, tc, "视频生成完成，正在下载文件...")
 
 	videoBytes, mimeType, err := t.downloadVideo(ctx, videoURL)
 	if err != nil {
@@ -212,6 +216,7 @@ func (t *SeedanceVideoGenerateTool) Execute(ctx context.Context, input map[strin
 	if err := t.storageSvc.UploadFile(ctx, convID, filename, videoBytes); err != nil {
 		return &ToolResult{Content: fmt.Sprintf("save generated video failed: %v", err), IsError: true}, nil
 	}
+	t.emitProgress(ctx, tc, "视频已保存，正在生成可下载结果...")
 	metadata, err := t.createArtifact(ctx, tc.ConversationID, tc.MessageID, filename, videoBytes, mimeType)
 	if err != nil {
 		return &ToolResult{Content: fmt.Sprintf("create video artifact failed: %v", err), IsError: true}, nil
@@ -253,7 +258,7 @@ func (t *SeedanceVideoGenerateTool) appendRefURLs(
 	}
 }
 
-func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, taskID string) (string, error) {
+func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, taskID string, tc *ToolContext) (string, error) {
 	timeoutSec := t.cfg.TimeoutSeconds
 	if timeoutSec <= 0 {
 		timeoutSec = 300
@@ -263,6 +268,7 @@ func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, 
 		pollSec = 5
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	lastProgressText := ""
 	for {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("timeout waiting for task %s", taskID)
@@ -270,6 +276,40 @@ func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, 
 		statusURL := buildSeedanceStatusURL(endpoint, t.cfg.StatusEndpointTemplate, taskID)
 		data, err := t.doJSON(ctx, http.MethodGet, statusURL, nil)
 		if err == nil {
+			status := strings.ToLower(strings.TrimSpace(firstString(data, "status", "state", "data.status", "data.state", "result.status", "result.state")))
+			if progress, ok := firstFloat(data,
+				"progress",
+				"percent",
+				"progress_percent",
+				"data.progress",
+				"data.percent",
+				"data.progress_percent",
+				"result.progress",
+				"result.percent",
+				"result.progress_percent",
+			); ok {
+				if progress < 0 {
+					progress = 0
+				}
+				if progress > 100 {
+					progress = 100
+				}
+				progressText := fmt.Sprintf("视频生成中：%.0f%%", progress)
+				if status != "" {
+					progressText += fmt.Sprintf("（%s）", status)
+				}
+				if progressText != lastProgressText {
+					lastProgressText = progressText
+					t.emitProgress(ctx, tc, progressText)
+				}
+			} else if status != "" {
+				progressText := fmt.Sprintf("视频生成状态：%s", status)
+				if progressText != lastProgressText {
+					lastProgressText = progressText
+					t.emitProgress(ctx, tc, progressText)
+				}
+			}
+
 			if videoURL := firstString(data,
 				"video_url",
 				"content.video_url",
@@ -280,7 +320,6 @@ func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, 
 			); videoURL != "" {
 				return videoURL, nil
 			}
-			status := strings.ToLower(strings.TrimSpace(firstString(data, "status", "state", "data.status", "data.state", "result.status", "result.state")))
 			if status == "failed" || status == "error" || status == "cancelled" {
 				msg := firstString(data, "error.message", "message", "data.error", "result.error")
 				if msg == "" {
@@ -295,6 +334,18 @@ func (t *SeedanceVideoGenerateTool) pollVideoURL(ctx context.Context, endpoint, 
 		case <-time.After(time.Duration(pollSec) * time.Second):
 		}
 	}
+}
+
+func (t *SeedanceVideoGenerateTool) emitProgress(ctx context.Context, tc *ToolContext, content string) {
+	toolUseID := ""
+	if tc != nil {
+		toolUseID = tc.ToolUseID
+	}
+	events.Emit(ctx, events.NewEvent("tool_progress", map[string]any{
+		"toolUseId": toolUseID,
+		"toolName":  t.Name(),
+		"content":   content,
+	}))
 }
 
 func (t *SeedanceVideoGenerateTool) doJSON(ctx context.Context, method, reqURL string, body any) (map[string]any, error) {
@@ -408,6 +459,24 @@ func toInt(v any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func firstFloat(m map[string]any, paths ...string) (float64, bool) {
+	for _, p := range paths {
+		switch v := getByPath(m, p).(type) {
+		case float64:
+			return v, true
+		case float32:
+			return float64(v), true
+		case int:
+			return float64(v), true
+		case int32:
+			return float64(v), true
+		case int64:
+			return float64(v), true
+		}
+	}
+	return 0, false
 }
 
 func extFromVideoURL(videoURL, mimeType string) string {

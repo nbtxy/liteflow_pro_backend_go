@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/liteflow/backend/internal/config"
@@ -9,12 +10,15 @@ import (
 func NewCloudflareProvider(cfg config.CloudflareConfig) *BaseOpenAIProvider {
 	model := cfg.Model
 	if model == "" {
-		model = "@cf/meta/llama-3.1-8b-instruct"
+		model = "anthropic/claude-opus-4-7"
 	}
 
 	headers := map[string]string{}
 	if cfg.Token != "" {
 		headers["cf-aig-authorization"] = "Bearer " + cfg.Token
+	}
+	if cfg.CacheTTL > 0 {
+		headers["cf-aig-cache-ttl"] = fmt.Sprintf("%d", cfg.CacheTTL)
 	}
 
 	return NewBaseOpenAIProvider(BaseOpenAIConfig{

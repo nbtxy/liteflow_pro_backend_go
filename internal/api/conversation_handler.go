@@ -12,11 +12,19 @@ import (
 )
 
 type ConversationHandler struct {
-	convSvc *conversation.Service
+	convSvc         *conversation.Service
+	streamStateProv interface {
+		ActiveStreamByConversation(userID uuid.UUID) map[string]string
+	}
 }
 
-func NewConversationHandler(convSvc *conversation.Service) *ConversationHandler {
-	return &ConversationHandler{convSvc: convSvc}
+func NewConversationHandler(
+	convSvc *conversation.Service,
+	streamStateProv interface {
+		ActiveStreamByConversation(userID uuid.UUID) map[string]string
+	},
+) *ConversationHandler {
+	return &ConversationHandler{convSvc: convSvc, streamStateProv: streamStateProv}
 }
 
 func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +59,7 @@ func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
 		if convs == nil {
 			convs = []domain.Conversation{}
 		}
+		applyActiveStreamState(convs, h.streamStateProv, userID)
 		OK(w, convs)
 		return
 	}
@@ -74,6 +83,7 @@ func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
 		if convs == nil {
 			convs = []domain.Conversation{}
 		}
+		applyActiveStreamState(convs, h.streamStateProv, userID)
 		total, _ := h.convSvc.CountActive(r.Context(), userID)
 		totalPages := int((total + int64(size) - 1) / int64(size))
 
@@ -101,6 +111,7 @@ func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
 	if convs == nil {
 		convs = []domain.Conversation{}
 	}
+	applyActiveStreamState(convs, h.streamStateProv, userID)
 
 	OK(w, convs)
 }
@@ -332,6 +343,28 @@ func flattenMessages(msgs []domain.Message) []messageResponse {
 		result = append(result, resp)
 	}
 	return result
+}
+
+func applyActiveStreamState(
+	convs []domain.Conversation,
+	streamStateProv interface {
+		ActiveStreamByConversation(userID uuid.UUID) map[string]string
+	},
+	userID uuid.UUID,
+) {
+	if len(convs) == 0 || streamStateProv == nil {
+		return
+	}
+	active := streamStateProv.ActiveStreamByConversation(userID)
+	if len(active) == 0 {
+		return
+	}
+	for i := range convs {
+		if streamID := active[convs[i].ID.String()]; streamID != "" {
+			sid := streamID
+			convs[i].ActiveStreamID = &sid
+		}
+	}
 }
 
 func (h *ConversationHandler) ClearMessages(w http.ResponseWriter, r *http.Request) {

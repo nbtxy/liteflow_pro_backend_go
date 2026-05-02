@@ -32,6 +32,7 @@ type Service struct {
 	memorySvc      *memory.Service
 	usageSvc       *usage.Service
 	taskScheduler  *task.Scheduler
+	streamMgr      *StreamManager
 }
 
 func NewService(
@@ -55,6 +56,7 @@ func NewService(
 		userSvc:        userSvc,
 		memorySvc:      memorySvc,
 		usageSvc:       usageSvc,
+		streamMgr:      NewStreamManager(512, 10*time.Minute),
 	}
 	return svc
 }
@@ -67,8 +69,90 @@ type ChatRequest struct {
 	ConversationID string            `json:"conversationId"`
 	Message        string            `json:"message"`
 	AgentID        string            `json:"agentId,omitempty"`
+	StreamID       string            `json:"streamId,omitempty"`
+	Reconnect      bool              `json:"reconnect,omitempty"`
 	Attachments    []json.RawMessage `json:"attachments,omitempty"`
 	QuotedMessage  json.RawMessage   `json:"quotedMessage,omitempty"`
+}
+
+type RegenerateRequest struct {
+	ConversationID string `json:"conversationId"`
+	MessageID      string `json:"messageId"`
+	StreamID       string `json:"streamId,omitempty"`
+	Reconnect      bool   `json:"reconnect,omitempty"`
+}
+
+func (s *Service) OpenStream(req ChatRequest, userID uuid.UUID) (<-chan agent.Event, string, error) {
+	if s.streamMgr == nil {
+		s.streamMgr = NewStreamManager(512, 10*time.Minute)
+	}
+	if req.Reconnect {
+		if strings.TrimSpace(req.StreamID) == "" {
+			return nil, "", fmt.Errorf("streamId is required for reconnect")
+		}
+		ch, err := s.streamMgr.Subscribe(strings.TrimSpace(req.StreamID), userID)
+		if err != nil {
+			return nil, "", err
+		}
+		return ch, strings.TrimSpace(req.StreamID), nil
+	}
+
+	streamID := strings.TrimSpace(req.StreamID)
+	if streamID == "" {
+		streamID = uuid.NewString()
+	}
+	req.StreamID = streamID
+	runCtx, cancel := context.WithCancel(context.Background())
+	source := s.ChatStream(runCtx, req, userID)
+	ch, resolvedID, err := s.streamMgr.Start(streamID, userID, strings.TrimSpace(req.ConversationID), source, cancel)
+	if err != nil {
+		cancel()
+		return nil, "", err
+	}
+	return ch, resolvedID, nil
+}
+
+func (s *Service) OpenRegenerateStream(req RegenerateRequest, userID uuid.UUID) (<-chan agent.Event, string, error) {
+	if s.streamMgr == nil {
+		s.streamMgr = NewStreamManager(512, 10*time.Minute)
+	}
+	if req.Reconnect {
+		if strings.TrimSpace(req.StreamID) == "" {
+			return nil, "", fmt.Errorf("streamId is required for reconnect")
+		}
+		ch, err := s.streamMgr.Subscribe(strings.TrimSpace(req.StreamID), userID)
+		if err != nil {
+			return nil, "", err
+		}
+		return ch, strings.TrimSpace(req.StreamID), nil
+	}
+
+	streamID := strings.TrimSpace(req.StreamID)
+	if streamID == "" {
+		streamID = uuid.NewString()
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	source := s.Regenerate(runCtx, req.ConversationID, req.MessageID, userID, streamID)
+	ch, resolvedID, err := s.streamMgr.Start(streamID, userID, strings.TrimSpace(req.ConversationID), source, cancel)
+	if err != nil {
+		cancel()
+		return nil, "", err
+	}
+	return ch, resolvedID, nil
+}
+
+func (s *Service) StopStream(streamID string, userID uuid.UUID) bool {
+	if s.streamMgr == nil {
+		return false
+	}
+	return s.streamMgr.Stop(strings.TrimSpace(streamID), userID)
+}
+
+func (s *Service) ActiveStreamByConversation(userID uuid.UUID) map[string]string {
+	if s.streamMgr == nil {
+		return map[string]string{}
+	}
+	return s.streamMgr.ActiveByConversation(userID)
 }
 
 func (s *Service) ChatStream(ctx context.Context, req ChatRequest, userID uuid.UUID) <-chan agent.Event {
@@ -205,6 +289,7 @@ func (s *Service) doChatStream(ctx context.Context, req ChatRequest, userID uuid
 	events <- agent.NewEvent(agent.EventStreamStart, map[string]any{
 		"messageId":      assistantMsgID.String(),
 		"conversationId": conv.ID.String(),
+		"streamId":       req.StreamID,
 	})
 
 	var contentParts []map[string]any
@@ -490,7 +575,7 @@ func buildToolDefsFromPool(pool map[string]tool.Tool) []llm.ToolDefinition {
 	return defs
 }
 
-func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID) <-chan agent.Event {
+func (s *Service) Regenerate(ctx context.Context, conversationID, messageID string, userID uuid.UUID, streamID string) <-chan agent.Event {
 	events := make(chan agent.Event, 64)
 
 	go func() {
@@ -614,6 +699,7 @@ func (s *Service) Regenerate(ctx context.Context, conversationID, messageID stri
 		events <- agent.NewEvent(agent.EventStreamStart, map[string]any{
 			"messageId":      newMsgID.String(),
 			"conversationId": convID.String(),
+			"streamId":       streamID,
 		})
 
 		var contentParts []map[string]any

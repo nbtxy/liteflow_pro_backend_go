@@ -97,7 +97,8 @@ type SeedanceConfig struct {
 
 type CloudflareConfig struct {
 	Endpoint         string `env:"CF_AI_GATEWAY_ENDPOINT"`
-	Model            string `env:"CF_AI_GATEWAY_MODEL" envDefault:"@cf/meta/llama-3.1-8b-instruct"`
+	Model            string `env:"CF_AI_GATEWAY_MODEL" envDefault:"anthropic/claude-opus-4-7"`
+	CacheTTL         int    `env:"CF_AI_GATEWAY_CACHE_TTL" envDefault:"3600"`
 	Token            string `env:"CF_AIG_TOKEN"`
 	OpenAIAPIKey     string `env:"OPENAI_API_KEY"`
 	ImageModel       string `env:"CF_AI_GATEWAY_IMAGE_MODEL" envDefault:"gemini-3.1-flash-image-preview"`
